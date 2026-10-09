@@ -453,7 +453,7 @@ fn web_debug_prefix_and_window_validation_fail_closed() {
 fn https_lanes_requires_separate_poll_and_control_handler_capacity() {
     let invalid = WEB_CONFIG.replace(
         "carrier = \"https-lanes\"",
-        "carrier = \"https-lanes\"\n\n[web.limits]\nmax_http_handlers = 1\nmax_body_readers = 1\nget_parallel_parts = 1",
+        "carrier = \"https-lanes\"\n\n[web.limits]\nmax_http_handlers = 1\nmax_body_readers = 1",
     );
     let error = load_config_error_from_temp_toml(&invalid);
     assert!(error.contains("WEB https-lanes candidates require"));

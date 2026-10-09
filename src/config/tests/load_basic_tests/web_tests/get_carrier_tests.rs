@@ -251,19 +251,38 @@ fn get_parallel_parts_defaults_and_bounds() {
 }
 
 #[test]
-fn get_parallel_parts_must_not_exceed_body_readers() {
+fn get_parallel_parts_is_independent_of_body_readers() {
+    // A GET fragment holds its reader permit only for the synchronous
+    // admission step, so the page-side parallelism never needs a reader
+    // each: a reader-limited config must keep loading for every vhost.
     let source = WEB_CONFIG.replace(
         "carrier = \"https-lanes\"",
-        "carrier = \"https-lanes\"\ncarrier_method = \"get\"\n\n[web.limits]\nget_parallel_parts = 5\nmax_body_readers = 4",
+        "carrier = \"https-lanes\"
+
+[web.limits]
+max_body_readers = 4",
     );
-    let error =
-        load_config_error_from_temp_toml(&format!("[general]\nconfig_strict = true\n{source}"));
-    assert!(error.contains("get_parallel_parts"), "got: {error}");
+    let config = load_config_from_temp_toml(&format!(
+        "[general]
+config_strict = true
+{source}"
+    ));
+    assert_eq!(config.web.limits.max_body_readers, 4);
+    assert_eq!(config.web.limits.get_parallel_parts, 6);
 
     let source = WEB_CONFIG.replace(
         "carrier = \"https-lanes\"",
-        "carrier = \"https-lanes\"\ncarrier_method = \"get\"\n\n[web.limits]\nget_parallel_parts = 4\nmax_body_readers = 4",
+        "carrier = \"https-lanes\"
+carrier_method = \"get\"
+
+[web.limits]
+get_parallel_parts = 16
+max_body_readers = 4",
     );
-    let config = load_config_from_temp_toml(&format!("[general]\nconfig_strict = true\n{source}"));
-    assert_eq!(config.web.limits.get_parallel_parts, 4);
+    let config = load_config_from_temp_toml(&format!(
+        "[general]
+config_strict = true
+{source}"
+    ));
+    assert_eq!(config.web.limits.get_parallel_parts, 16);
 }

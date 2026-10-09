@@ -197,9 +197,6 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     if !(1..=MAX_WEB_GET_PARALLEL_PARTS).contains(&limits.get_parallel_parts) {
         return config_error("web.limits.get_parallel_parts must be within [1, 16]");
     }
-    if limits.get_parallel_parts > limits.max_body_readers {
-        return config_error("web.limits.get_parallel_parts must not exceed max_body_readers");
-    }
     if !(1..=MAX_WEB_FRAME_BYTES).contains(&limits.max_frame_payload_bytes) {
         return config_error("web.limits.max_frame_payload_bytes must be within [1, 1048576]");
     }
