@@ -371,18 +371,23 @@ async function bench(method, rttMs, edge, label) {
     const idle = await page.evaluate(() =>
       window.__e2e.bench.ping(13, 25, 32, 120000),
     );
-    // The load upload is sized to outlast the ping series: with a fast
-    // uplink a fixed 1 MiB finishes early and the tail of the series then
+    // GET cells size the load upload to outlast the ping series: with a fast
+    // GET uplink a fixed 1 MiB finishes early and the tail of the series then
     // measures an idle carrier. Slow uplinks keep the original 1 MiB; the
     // cap stays below the initial 4 MiB stream window like the upload above.
+    // POST baseline cells keep the fixed 1 MiB so they stay comparable with
+    // earlier runs of the unchanged POST carrier.
     const pingSeriesMs = 25 * percentiles(idle).p50;
-    const loadBytes = Math.min(
-      3.5 * 1024 * 1024,
-      Math.max(
-        1024 * 1024,
-        Math.ceil((up.bytes / up.ms) * pingSeriesMs * 1.5),
-      ),
-    );
+    const loadBytes =
+      method === "get"
+        ? Math.min(
+            3.5 * 1024 * 1024,
+            Math.max(
+              1024 * 1024,
+              Math.ceil((up.bytes / up.ms) * pingSeriesMs * 1.5),
+            ),
+          )
+        : 1024 * 1024;
     const load = await page.evaluate(async (total) => {
       const upload = window.__e2e.bench.upload(14, total, 300000);
       const times = await window.__e2e.bench.ping(15, 25, 32, 120000);
