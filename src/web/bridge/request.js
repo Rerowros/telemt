@@ -49,7 +49,7 @@ function create(settings){
  // parts per operation with a shared ceiling, while HTTP/1.1 edges preserve
  // the browser six-connection envelope for the polls that share it.
  const getScheduler=(()=>{
-  let protocol='',upInflight=0,bypassInflight=0,downInflight=0,activeOps=0,ranks=0,deferred=null;const queue=[];
+  let protocol='',upInflight=0,bypassInflight=0,downInflight=0,activeOps=0,ranks=0,grants=0,deferred=null;const queue=[],served=new Map();
   // The last same-origin API resource entry pins the hop protocol; before
   // any API exchange completes the conservative HTTP/1.1 envelope applies.
   function detect(){
@@ -65,18 +65,29 @@ function create(settings){
   // connections, minus one kept free so control traffic never waits for a
   // bulk fragment to finish; at least one part always progresses.
   function cap(){detect();return multiplexed()?Math.min((settings.parallelParts?settings.parallelParts():1)*Math.max(1,activeOps),32):Math.max(1,6-downInflight-bypassInflight-1)}
-  // The oldest operation is served first so conveyor heads complete before
-  // later operations and the window keeps advancing.
+  // Lanes take turns: the lane granted least recently goes next, so a small
+  // operation never waits behind another lane's bulk upload. Inside a lane
+  // the oldest sequence goes first, so conveyor heads complete before later
+  // operations and a recovery replay keeps its place.
+  function before(a,b){
+   const ta=served.get(a.lane)||0,tb=served.get(b.lane)||0;
+   if(ta!==tb)return ta<tb;
+   if(a.lane===b.lane&&a.sequence!==b.sequence)return a.sequence<b.sequence;
+   return a.rank<b.rank;
+  }
   function pump(){
    while(queue.length&&upInflight<cap()){
-    let best=0;for(let i=1;i<queue.length;i++)if(queue[i].rank<queue[best].rank)best=i;
-    upInflight++;queue.splice(best,1)[0].grant();
+    let best=0;for(let i=1;i<queue.length;i++)if(before(queue[i],queue[best]))best=i;
+    const entry=queue.splice(best,1)[0];
+    served.set(entry.lane,++grants);
+    if(served.size>64)for(const lane of served.keys())if(!queue.some(item=>item.lane===lane))served.delete(lane);
+    upInflight++;entry.grant();
    }
   }
-  function acquire(signal,rank){
+  function acquire(signal,rank,lane,sequence){
    return new Promise((resolve,reject)=>{
     if(signal&&signal.aborted){reject(new Error('request aborted'));return}
-    const entry={rank,grant:()=>{if(signal)signal.removeEventListener('abort',abort);resolve()}};
+    const entry={rank,lane,sequence,grant:()=>{if(signal)signal.removeEventListener('abort',abort);resolve()}};
     function abort(){const index=queue.indexOf(entry);if(index>=0)queue.splice(index,1);reject(new Error('request aborted'))}
     if(signal)signal.addEventListener('abort',abort,{once:true});
     queue.push(entry);pump();
@@ -182,6 +193,7 @@ function create(settings){
   const deadline=Date.now()+Math.max(0,initialBudget),external=getFrozen.signal;
   const attemptLimit=path==='/api/v1/down'?settings.longPollMs()+settings.requestMs():settings.requestMs();
   const uplink=path==='/api/v1/up',downlink=path==='/api/v1/down';
+  const lane=headers['X-Lane-ID']===undefined?'':String(headers['X-Lane-ID']),sequence=Number(headers['X-Up-Seq'])||0;
   let rank=0,partsAcked=0,retryUntil=0;
   // One retry window per operation, opened by its first retryable failure
   // and closed only by an acknowledged part: without progress, retries of
@@ -209,7 +221,7 @@ function create(settings){
      // single-part control traffic and the closing part go around it so
      // small requests never queue behind a bulk upload; they still count
      // against the HTTP/1.1 envelope while they are in flight.
-     if(uplink&&total>1&&part<total-1){await getScheduler.acquire(controller.signal,rank);slot=true}
+     if(uplink&&total>1&&part<total-1){await getScheduler.acquire(controller.signal,rank,lane,sequence);slot=true}
      else if(uplink){getScheduler.bypassOpen();bypass=true}
      // The request deadline covers the network exchange only: time spent
      // queued behind an older operation is bounded by the operation budget.

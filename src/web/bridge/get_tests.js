@@ -1323,6 +1323,87 @@ test("a finished h1.1 long poll hands its connection to the re-poll first", asyn
   await flush();
 });
 
+test("h1.1 lanes take turns so a small upload never waits behind a bulk lane", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, {
+    parallelParts: () => 6,
+    retryMs: () => 60000,
+  });
+  const upload = (lane, sequence, bytes, fill) =>
+    requestClient
+      .send(
+        "/api/v1/up",
+        requestClient.options(
+          "POST",
+          SESSION,
+          frame(2, lane, new Array(bytes).fill(fill)),
+          { "X-Up-Seq": String(sequence), "X-Lane-ID": String(lane) },
+          null,
+        ),
+        null,
+        null,
+        null,
+      )
+      .catch(() => {});
+  // Lane 1 starts a bulk upload that fills the whole h1.1 parts pool.
+  upload(1, 1, 256 * 1024, 31);
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(inflight().length, 5, "the bulk lane holds every pooled slot");
+  // Lane 2 then needs two parts: one pooled fragment and the closing part.
+  upload(2, 1, 6000, 32);
+  await flush();
+  assert.equal(inflight().length, 5, "the small fragment queues");
+  // The first freed connection goes to the waiting lane, not to the bulk
+  // lane's next fragment even though that operation is older.
+  const done = inflight()[0];
+  env.answer(done, 204, null, { "X-Up-Part": params(done.url).get("p") });
+  await flush();
+  const granted = inflight().filter((r) => !r.answered);
+  const fresh = granted.filter((r) => params(r.url).get("l") === "2");
+  assert.equal(fresh.length, 1, "lane 2 receives the freed connection");
+  assert.equal(params(fresh[0].url).get("p"), "0");
+  env.close();
+  await flush();
+});
+
+test("a recovery replay of an older sequence goes first inside its lane", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, {
+    parallelParts: () => 6,
+    retryMs: () => 60000,
+  });
+  const upload = (sequence, bytes, fill) =>
+    requestClient
+      .send(
+        "/api/v1/up",
+        requestClient.options(
+          "POST",
+          SESSION,
+          frame(2, 1, new Array(bytes).fill(fill)),
+          { "X-Up-Seq": String(sequence), "X-Lane-ID": "1" },
+          null,
+        ),
+        null,
+        null,
+        null,
+      )
+      .catch(() => {});
+  upload(5, 256 * 1024, 33);
+  await flush();
+  // The replayed head is created later, so it carries the newer rank.
+  upload(4, 6000, 34);
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  const done = inflight()[0];
+  env.answer(done, 204, null, { "X-Up-Part": params(done.url).get("p") });
+  await flush();
+  const head = inflight().filter((r) => params(r.url).get("s") === "4");
+  assert.equal(head.length, 1, "the conveyor head takes the freed connection");
+  env.close();
+  await flush();
+});
+
 test("a multiplexed edge lifts the scheduler cap to K", async () => {
   const env = environment(renderedPage());
   env.setProtocol("h2");
