@@ -10,11 +10,14 @@ const get=(()=>{
   for(let i=0;i<bytes.length;i+=8190)binary+=String.fromCharCode.apply(null,bytes.subarray(i,i+8190));
   return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
  }
- function chunks(data,raw){
+ // Raw fragment views; each part is encoded only when its request is built
+ // so a large batch never blocks the page thread in one encoding burst.
+ function slices(data,raw){
   const bytes=data instanceof Uint8Array?data:new Uint8Array(data),parts=[];
-  for(let i=0;i<bytes.length;i+=raw)parts.push(encode(bytes.subarray(i,i+raw)));
+  for(let i=0;i<bytes.length;i+=raw)parts.push(bytes.subarray(i,i+raw));
   return parts;
  }
+ function chunks(data,raw){return slices(data,raw).map(encode)}
  function url(target,headers,nonce,close,data,part,total){
   const params=new URLSearchParams();
   if(close)params.set('op','close');
@@ -24,7 +27,7 @@ const get=(()=>{
   if(data!==undefined){params.set('d',data);if(total>1){params.set('p',String(part));params.set('pn',String(total))}}
   return target+'?'+params.toString();
  }
- return Object.freeze({nonce,encode,chunks,url});
+ return Object.freeze({nonce,encode,slices,chunks,url});
 })();
 function create(settings){
  const pause=(milliseconds,signal)=>new Promise((resolve,reject)=>{
@@ -45,7 +48,7 @@ function create(settings){
  // parts per operation with a shared ceiling, while HTTP/1.1 edges preserve
  // the browser six-connection envelope for the polls that share it.
  const getScheduler=(()=>{
-  let protocol='',upInflight=0,downInflight=0,activeOps=0;const queue=[];
+  let protocol='',upInflight=0,bypassInflight=0,downInflight=0,activeOps=0,ranks=0,deferred=null;const queue=[];
   // The last same-origin API resource entry pins the hop protocol; before
   // any API exchange completes the conservative HTTP/1.1 envelope applies.
   function detect(){
@@ -56,25 +59,42 @@ function create(settings){
    }catch(error){}
   }
   function multiplexed(){return protocol==='h2'||protocol==='h3'||protocol==='http/2'||protocol==='http/3'}
-  // HTTP/1.1 keeps two connections outside the parts pool: one for the long
-  // poll and one so single-part control traffic never waits behind uploads.
-  function cap(){detect();return multiplexed()?Math.min((settings.parallelParts?settings.parallelParts():1)*Math.max(1,activeOps),32):Math.max(1,6-downInflight-2)}
-  function pump(){while(queue.length&&upInflight<cap()){upInflight++;queue.shift()()}}
-  function acquire(signal){
+  // HTTP/1.1 parts share what the held long polls and in-flight unpooled
+  // uplinks (single-part operations, closing parts) leave of the six
+  // connections, minus one kept free so control traffic never waits for a
+  // bulk fragment to finish; at least one part always progresses.
+  function cap(){detect();return multiplexed()?Math.min((settings.parallelParts?settings.parallelParts():1)*Math.max(1,activeOps),32):Math.max(1,6-downInflight-bypassInflight-1)}
+  // The oldest operation is served first so conveyor heads complete before
+  // later operations and the window keeps advancing.
+  function pump(){
+   while(queue.length&&upInflight<cap()){
+    let best=0;for(let i=1;i<queue.length;i++)if(queue[i].rank<queue[best].rank)best=i;
+    upInflight++;queue.splice(best,1)[0].grant();
+   }
+  }
+  function acquire(signal,rank){
    return new Promise((resolve,reject)=>{
     if(signal&&signal.aborted){reject(new Error('request aborted'));return}
-    const waiter=()=>{if(signal)signal.removeEventListener('abort',abort);resolve()};
-    function abort(){const index=queue.indexOf(waiter);if(index>=0)queue.splice(index,1);reject(new Error('request aborted'))}
+    const entry={rank,grant:()=>{if(signal)signal.removeEventListener('abort',abort);resolve()}};
+    function abort(){const index=queue.indexOf(entry);if(index>=0)queue.splice(index,1);reject(new Error('request aborted'))}
     if(signal)signal.addEventListener('abort',abort,{once:true});
-    queue.push(waiter);pump();
+    queue.push(entry);pump();
    });
   }
-  function release(){upInflight--;pump()}
+  // The last acknowledged fragment of an operation hands its connection to
+  // the closing part that follows at once, so no queued fragment takes it.
+  function release(handoff){upInflight--;if(!handoff)pump()}
+  function rank(){return ++ranks}
+  function bypassOpen(){bypassInflight++}
+  function bypassClose(){bypassInflight--;pump()}
   function downOpen(){downInflight++}
-  function downClose(){downInflight--;pump()}
+  // A finished poll usually re-polls within the same task; granting its
+  // connection only after that lets the next poll keep it instead of
+  // queueing behind a fragment inside the browser connection pool.
+  function downClose(){downInflight--;if(deferred===null)deferred=setTimeout(()=>{deferred=null;pump()},0)}
   function opOpen(){activeOps++}
   function opClose(){activeOps--;pump()}
-  return{acquire,release,downOpen,downClose,opOpen,opClose};
+  return{acquire,release,rank,bypassOpen,bypassClose,downOpen,downClose,opOpen,opClose};
  })();
  const options=(method,token,body,headers,signal,keepalive)=>({
   method,body,signal,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
@@ -150,7 +170,7 @@ function create(settings){
    const overhead=get.url(settings.base()+path,headers,widest,close,'',4095,4096).length;
    const raw=Math.floor((settings.getUrlBytes()-overhead)/4)*3;
    if(raw<1)throw settings.failure('protocol','get url budget exceeded');
-   parts=get.chunks(body,raw);
+   parts=get.slices(body,raw);
    if(parts.length>4096)throw settings.failure('protocol','get part limit exceeded');
   }
   const total=parts?parts.length:1;maxAttempts=maxAttempts||9;
@@ -161,6 +181,7 @@ function create(settings){
   const deadline=Date.now()+Math.max(0,initialBudget),external=getFrozen.signal;
   const attemptLimit=path==='/api/v1/down'?settings.longPollMs()+settings.requestMs():settings.requestMs();
   const uplink=path==='/api/v1/up',downlink=path==='/api/v1/down';
+  let rank=0,partsAcked=0;
   if(downlink)getScheduler.downOpen();
   try{
    // One physical attempt for one part; the op signal additionally cancels
@@ -170,20 +191,26 @@ function create(settings){
     if(remaining<=0)return{kind:'budget'};
     // The URL is composed before the abort listener so a budget or nonce
     // failure can never leave an external listener installed.
-    const data=parts?parts[part]:undefined;
+    const data=parts?get.encode(parts[part]):undefined;
     const target=get.url(settings.base()+path,headers,get.nonce(),close,data,part,total);
     if(target.length>settings.getUrlBytes())throw settings.failure('protocol','get url budget exceeded');
-    const controller=new AbortController(),abort=()=>controller.abort();let timedOut=false,slot=false;
+    const controller=new AbortController(),abort=()=>controller.abort();let timedOut=false,slot=false,bypass=false,acked=false;
     if(external)external.addEventListener('abort',abort,{once:true});
     if(opSignal)opSignal.addEventListener('abort',abort,{once:true});
     const requestOptions=Object.assign({},getFrozen,{signal:controller.signal});
-    const timer=setTimeout(()=>{timedOut=true;controller.abort()},Math.max(1,Math.min(attemptLimit,remaining)));
-    let wait=0;
+    let wait=0,timer=null;
     try{
      // Only non-final parts of a fragmented uplink share the parallel pool:
      // single-part control traffic and the closing part go around it so
-     // small requests never queue behind a bulk upload.
-     if(uplink&&total>1&&part<total-1){await getScheduler.acquire(controller.signal);slot=true}
+     // small requests never queue behind a bulk upload; they still count
+     // against the HTTP/1.1 envelope while they are in flight.
+     if(uplink&&total>1&&part<total-1){await getScheduler.acquire(controller.signal,rank);slot=true}
+     else if(uplink){getScheduler.bypassOpen();bypass=true}
+     // The request deadline covers the network exchange only: time spent
+     // queued behind an older operation is bounded by the operation budget.
+     const left=Math.min(deadline-Date.now(),remainingBudget?remainingBudget():Infinity);
+     if(left<=0)return{kind:'budget'};
+     timer=setTimeout(()=>{timedOut=true;controller.abort()},Math.max(1,Math.min(attemptLimit,left)));
      const fetched=await fetch(target,requestOptions);
      if(retryableStatus(fetched.status)){wait=retryAfterMs(fetched);settings.cancel(fetched);return{kind:'retry',reason:'http',wait}}
      const policy=responsePolicy(path,fetched.status);let payload;
@@ -202,6 +229,7 @@ function create(settings){
       // the actual response is returned without sending remaining parts.
       if(response.status!==204)return{kind:'terminal',response};
       if(response.headers.get('X-Up-Part')!==String(part)||response.headers.get('X-Up-Ack')!==null)throw settings.failure('protocol','uplink part rejected');
+      acked=true;partsAcked++;
       return{kind:'part'};
      }
      if(uplink&&response.status===204&&response.headers.get('X-Up-Part')!==String(part))throw settings.failure('protocol','uplink part rejected');
@@ -213,8 +241,9 @@ function create(settings){
      if(timedOut)return{kind:'retry',reason:'timeout',wait:0};
      return{kind:'retry',reason:'network',wait};
     }finally{
-     clearTimeout(timer);
-     if(slot)getScheduler.release();
+     if(timer!==null)clearTimeout(timer);
+     if(slot)getScheduler.release(acked&&partsAcked===total-1);
+     if(bypass)getScheduler.bypassClose();
      if(external)external.removeEventListener('abort',abort);
      if(opSignal)opSignal.removeEventListener('abort',abort);
     }
@@ -222,13 +251,19 @@ function create(settings){
    // Retries one fragment inside the shared operation budget until the part
    // attempt cap ends it; terminal and aborted outcomes unwind immediately.
    async function sendPart(part,opSignal){
-    let delay=250,attemptCount=0,lastReason='network';
+    // Every GET exchange is one short request, so a multiplexed edge that
+    // retires its connection (an HTTP/2 GOAWAY after its per-connection
+    // request cap) can fail one in-flight request without any carrier fault.
+    // Idempotent uplink parts and downlink polls replay that request once at
+    // once instead of escalating the whole operation to session recovery.
+    let delay=250,attemptCount=0,lastReason='network',reissue=uplink||downlink?1:0;
     for(;;){
      if(settings.closed()||(external&&external.aborted))throw new Error('request aborted');
      if(opSignal&&opSignal.aborted)return{kind:'stop',reason:'cancelled',lastReason};
      if(attemptCount>=attempts())return{kind:'stop',reason:'attempts',lastReason};
      const outcome=await attempt(part,opSignal);
      if(outcome.kind!=='retry'&&outcome.kind!=='budget')return outcome;
+     if(outcome.kind==='retry'&&outcome.reason==='network'&&reissue>0){reissue--;continue}
      lastReason=outcome.reason||lastReason;
      // Retryable statuses (503 window backpressure above all) wait out the
      // operation deadline instead of spending the attempt cap; transport
@@ -247,9 +282,9 @@ function create(settings){
     // Non-final parts run through a bounded worker pool; the final part is
     // sent only after every earlier fragment is acknowledged server-side.
     const opAbort=new AbortController(),opSignal=opAbort.signal;
-    let next=0,accepted=0,terminal=null,reason='network';
+    let next=0,accepted=0,terminal=null,reason='network',closing=false;
     const workers=Math.min(settings.parallelParts?settings.parallelParts():1,total-1);
-    getScheduler.opOpen();
+    rank=getScheduler.rank();getScheduler.opOpen();
     try{
      const pool=[];
      for(let i=0;i<workers;i++)pool.push((async()=>{
@@ -264,12 +299,17 @@ function create(settings){
       }
      })());
      await Promise.all(pool);
-    }finally{opAbort.abort();getScheduler.opClose()}
+     closing=!terminal&&accepted===total-1;
+    }finally{opAbort.abort();if(!closing)getScheduler.opClose()}
     if(terminal)return terminal;
-    if(accepted<total-1)throw settings.failure(reason,'carrier retry limit reached');
-    const last=await sendPart(total-1,null);
-    if(last.kind==='done'||last.kind==='terminal')return last.response;
-    throw settings.failure(last.lastReason||'network','carrier retry limit reached');
+    if(!closing)throw settings.failure(reason,'carrier retry limit reached');
+    // The operation stays open until its closing part settles, so the
+    // scheduler regrants the handed-off connection only afterwards.
+    try{
+     const last=await sendPart(total-1,null);
+     if(last.kind==='done'||last.kind==='terminal')return last.response;
+     throw settings.failure(last.lastReason||'network','carrier retry limit reached');
+    }finally{getScheduler.opClose()}
    }
    // Sequential path: single-part and non-uplink operations keep the original
    // one-request-at-a-time retry driver.

@@ -516,9 +516,10 @@ test("close uses one fire-and-forget op=close GET without a body", async (page) 
   );
 });
 
-test("a multi-part uplink survives one loss per part inside the scaled budget", async (page) => {
+test("a multi-part uplink survives repeated loss per part inside the scaled budget", async (page) => {
   const env = environment(page);
-  // retryMs*total must cover one failed attempt plus backoff on every part.
+  // retryMs*total must cover one failed attempt plus backoff on every part;
+  // the first loss of each part is reissued at once, the second backs off.
   const requestClient = client(env, { retryMs: () => 600 });
   const body = join(
     frame(2, 1, new Array(32768).fill(4)),
@@ -541,7 +542,7 @@ test("a multi-part uplink survives one loss per part inside the scaled budget", 
       done = true;
     },
   );
-  const failed = new Set();
+  const failed = new Map();
   let elapsed = 0;
   for (let step = 0; step < 2000 && !done; step++) {
     const request = ups(env).filter((r) => !r.answered)[0];
@@ -552,8 +553,8 @@ test("a multi-part uplink survives one loss per part inside the scaled budget", 
     }
     const query = params(request.url),
       part = query.get("p");
-    if (!failed.has(part)) {
-      failed.add(part);
+    if ((failed.get(part) || 0) < 2) {
+      failed.set(part, (failed.get(part) || 0) + 1);
       request.answered = true;
       request.reject(new Error("lost"));
       await flush();
@@ -577,7 +578,11 @@ test("a multi-part uplink survives one loss per part inside the scaled budget", 
   assert.equal(
     failed.size,
     Number(params(ups(env)[0].url).get("pn")),
-    "every part lost once",
+    "every part lost",
+  );
+  assert.ok(
+    [...failed.values()].every((losses) => losses === 2),
+    "every part lost twice",
   );
   const nonces = new Set(ups(env).map((r) => params(r.url).get("n")));
   assert.equal(
@@ -586,6 +591,70 @@ test("a multi-part uplink survives one loss per part inside the scaled budget", 
     "every physical request owns a nonce",
   );
   env.close();
+});
+
+test("a transport failure reissues a fragment or poll once before recovery", async () => {
+  const env = environment(renderedPage());
+  // Committed carriers allow one attempt per request; the reissue is extra.
+  const requestClient = client(env, { parallelParts: () => 1 });
+  const body = join(
+    frame(2, 1, new Array(6000).fill(71)),
+    frame(2, 1, new Array(6000).fill(72)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    1,
+    null,
+  );
+  let failure = null;
+  operation.catch((error) => {
+    failure = error;
+  });
+  await flush();
+  const lost = ups(env).filter((r) => !r.answered)[0];
+  lost.answered = true;
+  lost.reject(new TypeError("Failed to fetch"));
+  await flush();
+  const reissued = ups(env).filter((r) => !r.answered)[0];
+  assert.ok(reissued, "the fragment is reissued without waiting for a timer");
+  assert.equal(params(reissued.url).get("p"), params(lost.url).get("p"));
+  assert.equal(params(reissued.url).get("d"), params(lost.url).get("d"));
+  assert.notEqual(params(reissued.url).get("n"), params(lost.url).get("n"));
+  // A second transport failure of the same request escalates as before.
+  reissued.answered = true;
+  reissued.reject(new TypeError("Failed to fetch"));
+  await flush();
+  assert.ok(failure, "the operation fails over to recovery");
+  assert.equal(failure.telemtReason, "network");
+  assert.equal(ups(env).filter((r) => !r.answered).length, 0);
+
+  const poll = requestClient.send(
+    "/api/v1/down",
+    requestClient.options(
+      "POST",
+      SESSION,
+      null,
+      { "X-Down-Cursor": "0" },
+      null,
+    ),
+    null,
+    1,
+    null,
+  );
+  await flush();
+  const first = env.pending("/api/v1/down")[0];
+  first.answered = true;
+  first.reject(new TypeError("Failed to fetch"));
+  await flush();
+  const again = env.pending("/api/v1/down")[0];
+  assert.ok(again, "the poll is reissued once");
+  assert.equal(params(again.url).get("c"), "0");
+  env.answer(again, 204, null, {});
+  assert.equal((await poll).status, 204);
+  env.close();
+  await flush();
 });
 
 test("direct url construction throws before fetch when the budget is exceeded", async (page) => {
@@ -834,8 +903,8 @@ test("the h1.1 scheduler leaves connections for an active long poll", async () =
   const inflight = () => ups(env).filter((r) => !r.answered);
   assert.equal(
     inflight().length,
-    3,
-    "cap is 6 - 1 long poll - 2 reserve despite K=8",
+    4,
+    "cap is 6 - 1 long poll - 1 reserve despite K=8",
   );
   const request = inflight()[0];
   env.answer(request, 204, null, {
@@ -843,7 +912,7 @@ test("the h1.1 scheduler leaves connections for an active long poll", async () =
   });
   await flush();
   assert.ok(
-    inflight().length <= 3,
+    inflight().length <= 4,
     "grants stay bounded while the poll is held",
   );
   env.close();
@@ -886,15 +955,15 @@ test("each held long poll tightens the h1.1 parts cap", async () => {
   await flush();
   assert.equal(
     ups(env).filter((r) => !r.answered).length,
-    2,
-    "cap is 6 - 2 long polls - 2 reserve",
+    3,
+    "cap is 6 - 2 long polls - 1 reserve",
   );
   env.close();
   await flush();
 });
 
 test("single-part and final uplink parts bypass the parts pool", async () => {
-  // Unknown protocol keeps the conservative h1.1 envelope: cap = 6 - 0 - 2.
+  // Unknown protocol keeps the conservative h1.1 envelope: cap = 6 - 0 - 1.
   const env = environment(renderedPage());
   const requestClient = client(env, { parallelParts: () => 6 });
   const bulk = (marker) =>
@@ -922,7 +991,7 @@ test("single-part and final uplink parts bypass the parts pool", async () => {
   const opA = uplink(7, bulk(41));
   await flush();
   const inflight = () => ups(env).filter((r) => !r.answered);
-  assert.equal(inflight().length, 4, "four parts hold the h1.1 cap");
+  assert.equal(inflight().length, 5, "five parts hold the h1.1 cap");
   // A single-part operation never queues behind bulk fragments.
   const ping = uplink(9, frame(5, 1, [9]));
   await flush();
@@ -963,10 +1032,143 @@ test("single-part and final uplink parts bypass the parts pool", async () => {
     (r) => seqA(r) && params(r.url).get("p") === lastIndex,
   );
   assert.ok(final, "final part dispatched while the pool stays saturated");
-  assert.equal(inflight().length, 5, "final bypasses the four held slots");
+  // The last acknowledged fragment hands its connection to the closing part
+  // and the in-flight final then shrinks the pool, so one stays free.
+  assert.equal(inflight().length, 5, "final takes the handed-off slot");
   env.answer(final, 204, null, { "X-Up-Ack": "7", "X-Up-Part": lastIndex });
   const response = await opA;
   assert.equal(response.status, 204);
+  env.close();
+  await flush();
+});
+
+// Browser view of the HTTP/1.1 envelope: every unanswered, unaborted carrier
+// request holds one of the six connections the browser keeps per origin.
+function connectionsInUse(env) {
+  return env.requests.filter(
+    (r) =>
+      !r.answered &&
+      !r.options.signal.aborted &&
+      ["/api/v1/up", "/api/v1/down"].includes(pathname(r.url)),
+  ).length;
+}
+
+test("held closing parts shrink the h1.1 pool so a ping finds a free connection", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 6 });
+  const send = (path, body, headers) => {
+    const operation = requestClient.send(
+      path,
+      requestClient.options("POST", SESSION, body, headers, null),
+      null,
+      path === "/api/v1/down" ? 1 : null,
+      null,
+    );
+    operation.catch(() => {});
+    return operation;
+  };
+  send("/api/v1/down", null, { "X-Down-Cursor": "0" });
+  // Two two-part operations whose closing parts the server holds while an
+  // earlier sequence is still being applied.
+  const small = (marker) => frame(2, 1, new Array(6000).fill(marker));
+  send("/api/v1/up", small(51), { "X-Up-Seq": "7" });
+  send("/api/v1/up", small(52), { "X-Up-Seq": "8" });
+  await flush();
+  for (const sequence of ["7", "8"]) {
+    const first = ups(env).find(
+      (r) => !r.answered && params(r.url).get("s") === sequence,
+    );
+    assert.equal(params(first.url).get("p"), "0");
+    env.answer(first, 204, null, { "X-Up-Part": "0" });
+    await flush();
+    assert.ok(
+      ups(env).some(
+        (r) =>
+          !r.answered &&
+          params(r.url).get("s") === sequence &&
+          params(r.url).get("p") === "1",
+      ),
+      "closing part dispatched and held",
+    );
+  }
+  // A bulk upload now competes for the remaining connections.
+  send(
+    "/api/v1/up",
+    join(
+      frame(2, 1, new Array(48 * 1024).fill(53)),
+      frame(2, 1, new Array(48 * 1024).fill(54)),
+    ),
+    { "X-Up-Seq": "9" },
+  );
+  await flush();
+  assert.ok(
+    connectionsInUse(env) < 6,
+    `poll + held finals + fragments must leave a connection free (in use: ${connectionsInUse(env)})`,
+  );
+  const ping = send("/api/v1/up", frame(5, 1, [9]), { "X-Up-Seq": "10" });
+  await flush();
+  const single = ups(env).find(
+    (r) => !r.answered && params(r.url).get("s") === "10",
+  );
+  assert.ok(single, "the ping is dispatched at once");
+  env.answer(single, 204, null, { "X-Up-Ack": "10", "X-Up-Part": "0" });
+  assert.equal((await ping).status, 204);
+  env.close();
+  await flush();
+});
+
+test("a finished h1.1 long poll hands its connection to the re-poll first", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 8 });
+  const poll = (cursor) => {
+    const operation = requestClient.send(
+      "/api/v1/down",
+      requestClient.options(
+        "POST",
+        SESSION,
+        null,
+        { "X-Down-Cursor": cursor },
+        null,
+      ),
+      null,
+      1,
+      null,
+    );
+    operation.catch(() => {});
+    return operation;
+  };
+  const first = poll("0");
+  await flush();
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options(
+      "POST",
+      SESSION,
+      join(
+        frame(2, 1, new Array(48 * 1024).fill(61)),
+        frame(2, 1, new Array(48 * 1024).fill(62)),
+      ),
+      { "X-Up-Seq": "7" },
+      null,
+    ),
+    null,
+    null,
+    null,
+  );
+  operation.catch(() => {});
+  await flush();
+  const parts = () => ups(env).filter((r) => !r.answered).length;
+  const before = parts();
+  // The poll loop re-polls as soon as the previous poll settles.
+  first.then(() => poll("1"));
+  env.answer(env.pending("/api/v1/down")[0], 204, null, {
+    "X-Down-Cursor": "1",
+  });
+  await flush();
+  assert.equal(env.pending("/api/v1/down").length, 1, "re-poll issued");
+  assert.equal(parts(), before, "no fragment took the poll's connection");
+  await env.tick(0);
+  assert.equal(parts(), before, "the regrant still sees the held re-poll");
   env.close();
   await flush();
 });
