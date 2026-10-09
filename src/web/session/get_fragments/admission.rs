@@ -249,36 +249,27 @@ impl WebSession {
                 if sequence <= floor || sequence > floor.saturating_add(window) {
                     return Err(GetUpReject::Decoy);
                 }
-                if sequence <= committed {
-                    // The record is gone but the sequence already applied:
-                    // acknowledge idempotently instead of reapplying frames.
-                    self.touch_peer_locked(
-                        &mut state,
-                        now,
-                        WebSessionLifecycleObservation::HttpActivityAfterGap,
-                    );
-                    return Ok(GetUpOffer::Duplicate);
-                }
-            } else {
-                // Legacy ordering admits exactly the next sequence; the last
-                // applied sequence may replay idempotently after retirement.
-                if sequence == last_up && last_up != 0 {
-                    self.touch_peer_locked(
-                        &mut state,
-                        now,
-                        WebSessionLifecycleObservation::HttpActivityAfterGap,
-                    );
-                    return Ok(GetUpOffer::Duplicate);
-                }
-                if sequence != last_up.saturating_add(1) {
-                    return Err(GetUpReject::Decoy);
-                }
+            } else if sequence != last_up.saturating_add(1) && (sequence != last_up || last_up == 0)
+            {
+                // Legacy ordering admits the next sequence and replays of the
+                // last applied one.
+                return Err(GetUpReject::Decoy);
             }
+            // An applied sequence whose record retired replays like a POST
+            // body: it reassembles in full and the canonical path verifies
+            // its digest (closing the session on a mismatch) and answers 503
+            // while negotiation is open. Nothing is acknowledged unverified.
+            let replay = sequence <= lane_committed(&state, lane_id, confirmed.is_some());
             // Any non-final part may open a reassembly record; the final part
             // cannot because it is only admitted once all others are stored.
-            // Already-applied sequences answered above stay idempotent.
+            // A lone final of an applied sequence cannot be proven, so it is
+            // stale and the bridge recovery replays the whole operation.
             if total > 1 && part == total - 1 {
-                return Err(GetUpReject::Decoy);
+                return Err(if replay {
+                    GetUpReject::Stale
+                } else {
+                    GetUpReject::Decoy
+                });
             }
             // A valid new sequence retires the completed records it
             // supersedes before the per-lane record bound applies.
@@ -327,7 +318,9 @@ impl WebSession {
             let ceiling = max_body.saturating_add(GET_MAX_PARTS as usize * GET_PART_META_BYTES);
             let window = state.conveyor.offer_window();
             let lane_bound = lane_committed(&state, lane_id, confirmed.is_some());
-            let head = sequence == lane_bound.saturating_add(1);
+            // A replay of an applied sequence never holds the conveyor back,
+            // so it shares the head's full window budget.
+            let head = sequence <= lane_bound.saturating_add(1);
             let bound = ceiling.saturating_mul(if head {
                 window
             } else {

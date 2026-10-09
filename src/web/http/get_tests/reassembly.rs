@@ -469,7 +469,7 @@ async fn get_carrier_close_clears_pending_fragments() {
 }
 
 #[tokio::test]
-async fn get_carrier_final_replay_after_record_retired_acks_idempotently() {
+async fn get_carrier_retired_replay_is_never_acknowledged_unverified() {
     let capability = [29u8; 32];
     let generation = test_runtime_generation(1, get_runtime_config(capability, WebCarrier::Https));
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
@@ -502,37 +502,41 @@ async fn get_carrier_final_replay_after_record_retired_acks_idempotently() {
     .await;
     assert!(split_response(&next).0.starts_with(b"HTTP/1.1 204"));
 
-    // A late replay of the applied final part acknowledges like a duplicate
-    // POST body instead of falling into the decoy path.
-    let replay = get_request(
-        &listener,
-        &runtime,
-        &format!("/api/v1/up?t={session}&n=5&s=1&d={}&p=1&pn=2", b64(tail)),
-        "",
-    )
-    .await;
-    let replay_headers = split_response(&replay).0;
-    assert!(replay_headers.starts_with(b"HTTP/1.1 204"));
-    assert_eq!(response_header(replay_headers, "x-up-ack"), "1");
-    assert_eq!(response_header(replay_headers, "x-up-part"), "1");
-    // A late non-final replay is acknowledged as a stored part only.
+    // A late final part of the retired sequence cannot be verified against
+    // the applied body, so it is stale (409) rather than acknowledged; with
+    // other bytes it must not be acknowledged either.
+    for (nonce, data) in [(5, tail), (6, head)] {
+        let replay = get_request(
+            &listener,
+            &runtime,
+            &format!(
+                "/api/v1/up?t={session}&n={nonce}&s=1&d={}&p=1&pn=2",
+                b64(data)
+            ),
+            "",
+        )
+        .await;
+        let replay_headers = split_response(&replay).0;
+        assert!(replay_headers.starts_with(b"HTTP/1.1 409"));
+        assert!(!has_header(replay_headers, "x-up-ack"));
+    }
+    // A late non-final part cannot reopen the sequence while the next one
+    // holds the only legacy record slot.
     let part_replay = get_request(
         &listener,
         &runtime,
-        &format!("/api/v1/up?t={session}&n=6&s=1&d={}&p=0&pn=2", b64(head)),
+        &format!("/api/v1/up?t={session}&n=7&s=1&d={}&p=0&pn=2", b64(head)),
         "",
     )
     .await;
-    let part_headers = split_response(&part_replay).0;
-    assert!(part_headers.starts_with(b"HTTP/1.1 204"));
-    assert_eq!(response_header(part_headers, "x-up-part"), "0");
-    assert!(!has_header(part_headers, "x-up-ack"));
+    assert!(!has_header(split_response(&part_replay).0, "x-up-ack"));
+    assert!(!has_header(split_response(&part_replay).0, "x-up-part"));
 
     // The open sequence still completes normally afterwards.
     let last = get_request(
         &listener,
         &runtime,
-        &format!("/api/v1/up?t={session}&n=7&s=2&d={}&p=1&pn=2", b64(tail)),
+        &format!("/api/v1/up?t={session}&n=8&s=2&d={}&p=1&pn=2", b64(tail)),
         "",
     )
     .await;

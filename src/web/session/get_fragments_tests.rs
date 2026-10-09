@@ -9,11 +9,16 @@ use crate::config::{
 };
 use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
-use crate::web::manager::WebProcessRuntime;
-use crate::web::session::WebSession;
+use crate::web::manager::{ManagerError, WebProcessRuntime};
+use crate::web::session::{ConveyorError, WebSession};
 
 /// Minimal live session with default limits and timeouts for fragment tests.
 fn session() -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
+    session_with(false)
+}
+
+/// Same session, optionally created by automatic carrier negotiation.
+fn session_with(automatic: bool) -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
     let generation = test_runtime_generation(1, ProxyConfig::default());
     let manager = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation)));
     let profile = Arc::new(WebRuntimeProfile {
@@ -50,7 +55,7 @@ fn session() -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
         None,
         crate::web::manager::CarrierClientClass::Legacy,
         None,
-        false,
+        automatic,
         false,
         WebLimitsConfig::default(),
         timeouts,
@@ -185,9 +190,9 @@ async fn commitment_cap_is_busy_until_expiry_frees_capacity() {
     manager.shutdown().await;
 }
 
-/// Replays of an expired completed record resolve from the applied sequence.
+/// Replays of an expired completed record are verified like POST replays.
 #[tokio::test]
-async fn completed_record_expiry_makes_replays_idempotent() {
+async fn completed_record_expiry_replays_verify_like_post() {
     let (session, manager) = session();
     session.configure_conveyor(4);
     let free = manager.body_bytes_available();
@@ -221,12 +226,102 @@ async fn completed_record_expiry_makes_replays_idempotent() {
     assert_eq!(committed_bytes(&session), 0);
     assert_eq!(manager.body_bytes_available(), free);
 
-    // Replays of the expired record acknowledge idempotently: the applied
-    // sequence answers without re-storing or re-verifying fragment bytes.
+    // A lone final part of the expired record cannot be verified, so it is
+    // stale instead of acknowledged.
     let final_replay = session.offer_get_up(None, 1, Some(0), 1, 2, pong.clone());
-    assert!(matches!(final_replay, Ok(GetUpOffer::Duplicate)));
+    assert!(matches!(final_replay, Err(GetUpReject::Stale)));
+    // A full replay reassembles and the canonical claim checks its digest
+    // against the applied body without reapplying frames.
     let part_replay = session.offer_get_up(None, 1, Some(0), 0, 2, head.clone());
-    assert!(matches!(part_replay, Ok(GetUpOffer::Duplicate)));
+    assert!(matches!(part_replay, Ok(GetUpOffer::Pending(0))));
+    let Ok(GetUpOffer::Complete { body, .. }) =
+        session.offer_get_up(None, 1, Some(0), 1, 2, pong.clone())
+    else {
+        panic!("a full replay completes");
+    };
+    let claim = session
+        .claim_conveyor(None, 1, Some(0))
+        .unwrap()
+        .expect("conveyor mode admits the replay claim");
+    assert_eq!(claim.process(&body).await, Ok(1));
+    assert!(!session.state.lock().closed);
+
+    manager.shutdown().await;
+}
+
+/// Applies sequence 1 as one two-part GET operation, then expires its record.
+async fn applied_then_expired(session: &Arc<WebSession>) {
+    session.configure_conveyor(4);
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    let head = pong.iter().copied().cycle().take(32).collect::<Bytes>();
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 0, 2, head),
+        Ok(GetUpOffer::Pending(0))
+    ));
+    let Ok(GetUpOffer::Complete { body, .. }) = session.offer_get_up(None, 1, Some(0), 1, 2, pong)
+    else {
+        panic!("final part completes the two-part operation");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    // An automatic carrier answers 503 for a body without stream progress
+    // until it commits, but the sequence is applied either way.
+    let applied = claim.process(&body).await;
+    assert!(matches!(
+        applied,
+        Ok(1) | Err(ConveyorError::Manager(ManagerError::Backpressure))
+    ));
+    assert_eq!(session.state.lock().conveyor.sequence_floor(None).1, 1);
+    let expired = Instant::now() + Duration::from_secs(95);
+    touch_peer_at(session, expired);
+    assert!(!session.close_if_due(expired));
+}
+
+/// A replay of a retired applied sequence with other bytes closes the
+/// session exactly like a POST body with a different digest.
+#[tokio::test]
+async fn retired_replay_with_another_digest_closes_the_session() {
+    let (session, manager) = session();
+    applied_then_expired(&session).await;
+
+    let other = frame::encode(FrameType::Pong, 0, &[]);
+    let Ok(GetUpOffer::Complete { body, .. }) =
+        session.offer_get_up(None, 1, Some(0), 0, 1, other.into())
+    else {
+        panic!("a single-part replay reassembles");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(
+        claim.process(&body).await,
+        Err(ConveyorError::Manager(ManagerError::Protocol))
+    );
+    assert!(session.state.lock().closed);
+
+    manager.shutdown().await;
+}
+
+/// While the carrier is still negotiated a verified replay answers 503,
+/// matching the canonical POST duplicate.
+#[tokio::test]
+async fn retired_replay_during_negotiation_is_busy() {
+    let (session, manager) = session_with(true);
+    applied_then_expired(&session).await;
+
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    let head = pong.iter().copied().cycle().take(32).collect::<Bytes>();
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 0, 2, head),
+        Ok(GetUpOffer::Pending(0))
+    ));
+    let Ok(GetUpOffer::Complete { body, .. }) = session.offer_get_up(None, 1, Some(0), 1, 2, pong)
+    else {
+        panic!("a full replay completes");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(
+        claim.process(&body).await,
+        Err(ConveyorError::Manager(ManagerError::Backpressure))
+    );
+    assert!(!session.state.lock().closed);
 
     manager.shutdown().await;
 }

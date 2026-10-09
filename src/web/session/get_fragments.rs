@@ -60,8 +60,6 @@ pub(crate) enum GetUpOffer {
         body: Bytes,
         budget: Arc<OwnedSemaphorePermit>,
     },
-    /// The sequence already applied server-side; acknowledge without reapplying.
-    Duplicate,
 }
 
 /// Rejection classes mapped onto existing transport responses.
@@ -71,6 +69,9 @@ pub(crate) enum GetUpReject {
     Decoy,
     /// Shared capacity is exhausted for this physical request; retry is safe.
     Busy,
+    /// A lone final part of an applied sequence whose record retired cannot
+    /// be verified; it answers like a stale POST replay.
+    Stale,
 }
 
 impl GetFragments {
