@@ -36,13 +36,14 @@ function create(settings){
   function abort(){clearTimeout(timer);signal.removeEventListener('abort',abort);reject(new Error('request aborted'))}
   if(signal)signal.addEventListener('abort',abort,{once:true});
  });
- // Combines two abort signals so queued and in-flight parts share one trigger.
+ // Combines two abort signals for one wait; dispose detaches both listeners
+ // so repeated backoffs never accumulate handlers on long-lived signals.
  const mergeSignals=(a,b)=>{
-  if(!a||!b)return a||b;
+  if(!a||!b)return{signal:a||b,dispose(){}};
   const merged=new AbortController(),fire=()=>merged.abort();
   a.addEventListener('abort',fire,{once:true});b.addEventListener('abort',fire,{once:true});
   if(a.aborted||b.aborted)fire();
-  return merged.signal;
+  return{signal:merged.signal,dispose(){a.removeEventListener('abort',fire);b.removeEventListener('abort',fire)}};
  };
  // Page-wide GET uplink scheduler: multiplexed edges allow the configured K
  // parts per operation with a shared ceiling, while HTTP/1.1 edges preserve
@@ -181,7 +182,11 @@ function create(settings){
   const deadline=Date.now()+Math.max(0,initialBudget),external=getFrozen.signal;
   const attemptLimit=path==='/api/v1/down'?settings.longPollMs()+settings.requestMs():settings.requestMs();
   const uplink=path==='/api/v1/up',downlink=path==='/api/v1/down';
-  let rank=0,partsAcked=0;
+  let rank=0,partsAcked=0,retryUntil=0;
+  // One retry window per operation, opened by its first retryable failure
+  // and closed only by an acknowledged part: without progress, retries of
+  // any number of parts share one bridge_retry_secs before recovery.
+  const retryLeft=()=>{if(!retryUntil)retryUntil=Date.now()+settings.retryMs();return retryUntil-Date.now()};
   if(downlink)getScheduler.downOpen();
   try{
    // One physical attempt for one part; the op signal additionally cancels
@@ -229,7 +234,7 @@ function create(settings){
       // the actual response is returned without sending remaining parts.
       if(response.status!==204)return{kind:'terminal',response};
       if(response.headers.get('X-Up-Part')!==String(part)||response.headers.get('X-Up-Ack')!==null)throw settings.failure('protocol','uplink part rejected');
-      acked=true;partsAcked++;
+      acked=true;partsAcked++;retryUntil=0;
       return{kind:'part'};
      }
      if(uplink&&response.status===204&&response.headers.get('X-Up-Part')!==String(part))throw settings.failure('protocol','uplink part rejected');
@@ -269,16 +274,18 @@ function create(settings){
      if(outcome.kind!=='retry'&&outcome.kind!=='budget')return outcome;
      if(outcome.kind==='retry'&&reissue>0&&(outcome.reason==='network'||(pooled&&outcome.reason==='timeout'))){reissue--;continue}
      lastReason=outcome.reason||lastReason;
-     // Retryable statuses (503 window backpressure above all) wait out the
-     // operation deadline instead of spending the attempt cap; transport
-     // failures still escalate to the shared recovery path.
-     if(outcome.reason!=='http')attemptCount++;
+     // A non-final fragment answered with a retryable status (503 commitment
+     // backpressure above all) waits inside the operation retry window
+     // without spending the attempt cap; every other request counts each
+     // failure exactly like the POST carrier and escalates to recovery.
+     if(!(pooled&&outcome.reason==='http'))attemptCount++;
      if(outcome.kind==='budget'||attemptCount>=attempts())return{kind:'stop',reason:'budget',lastReason};
-     const after=Math.min(deadline-Date.now(),remainingBudget?remainingBudget():Infinity);
+     const after=Math.min(deadline-Date.now(),remainingBudget?remainingBudget():Infinity,retryLeft());
      if(after<=0)return{kind:'stop',reason:'budget',lastReason};
      settings.retrying();
      const backoff=outcome.wait||delay+Math.floor(Math.random()*Math.max(1,delay/4));
-     await pause(Math.min(backoff,after),mergeSignals(external,opSignal));
+     const wake=mergeSignals(external,opSignal);
+     try{await pause(Math.min(backoff,after),wake.signal)}finally{wake.dispose()}
      delay=Math.min(delay*2,2000);
     }
    }

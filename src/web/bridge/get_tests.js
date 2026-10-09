@@ -916,6 +916,107 @@ test("a 503 fragment answer retries inside the same operation", async () => {
   await flush();
 });
 
+// Counts live abort listeners so leaked backoff handlers become visible.
+function countingSignal(env) {
+  const controller = new env.context.AbortController(),
+    signal = controller.signal,
+    live = new Set(),
+    add = signal.addEventListener.bind(signal),
+    remove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = (type, fn, options) => {
+    if (type === "abort") live.add(fn);
+    add(type, fn, options);
+  };
+  signal.removeEventListener = (type, fn, options) => {
+    if (type === "abort") live.delete(fn);
+    remove(type, fn, options);
+  };
+  return { signal, live: () => live.size };
+}
+
+test("a 503 storm escalates within one retry window for the whole operation", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, {
+    parallelParts: () => 1,
+    retryMs: () => 600,
+  });
+  const external = countingSignal(env);
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(17)),
+    frame(2, 1, new Array(48 * 1024).fill(18)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options(
+      "POST",
+      SESSION,
+      body,
+      { "X-Up-Seq": "7" },
+      external.signal,
+    ),
+    null,
+    null,
+    null,
+  );
+  let failure = null;
+  operation.catch((error) => {
+    failure = error;
+  });
+  await flush();
+  const total = Number(params(ups(env)[0].url).get("pn"));
+  assert.ok(total >= 3, "the operation spans several parts");
+  let pauses = 0,
+    maxLive = 0;
+  // Every part keeps answering 503: the per-part scaled deadline would let
+  // this spin for retryMs*total, the operation window ends it after retryMs.
+  for (let elapsed = 0; elapsed < 1500 && !failure; elapsed += 50) {
+    for (const busy of ups(env).filter((r) => !r.answered)) {
+      env.answer(busy, 503, null);
+      pauses++;
+    }
+    await flush();
+    maxLive = Math.max(maxLive, external.live());
+    await env.tick(50);
+  }
+  assert.ok(pauses >= 3, "several backoffs happened");
+  assert.ok(failure, "the operation escalates within one retry window");
+  assert.equal(failure.telemtReason, "http");
+  assert.ok(maxLive <= 1, `backoffs leave no abort listeners (${maxLive})`);
+  assert.equal(external.live(), 0);
+  env.close();
+  await flush();
+});
+
+test("a 502 long poll with one attempt escalates like the POST carrier", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { retryMs: () => 90000 });
+  const poll = requestClient.send(
+    "/api/v1/down",
+    requestClient.options(
+      "POST",
+      SESSION,
+      null,
+      { "X-Down-Cursor": "0" },
+      null,
+    ),
+    null,
+    1,
+    null,
+  );
+  let failure = null;
+  poll.catch((error) => {
+    failure = error;
+  });
+  await flush();
+  env.answer(env.pending("/api/v1/down")[0], 502, null);
+  await flush();
+  assert.ok(failure, "the poll escalates without waiting in reconnecting");
+  assert.equal(failure.telemtReason, "http");
+  assert.equal(env.pending("/api/v1/down").length, 0);
+  env.close();
+  await flush();
+});
+
 test("the h1.1 scheduler leaves connections for an active long poll", async () => {
   const env = environment(renderedPage());
   const requestClient = client(env, { parallelParts: () => 8 });
