@@ -7,6 +7,8 @@ pub(super) fn validate_vhosts(config: &mut ProxyConfig) -> Result<()> {
     }
     let mut hosts = HashSet::with_capacity(config.web.vhosts.len());
     let mut profile_count = 0usize;
+    // With no vhosts the global method is the effective method for any host.
+    let mut get_carrier_hosts = config.web.vhosts.is_empty() && config.web.carrier_method.is_get();
     for (vhost_idx, vhost) in config.web.vhosts.iter_mut().enumerate() {
         vhost.host = normalize_web_host(&vhost.host, &format!("web.vhosts[{vhost_idx}].host"))?;
         validate_web_base_path(
@@ -27,6 +29,18 @@ pub(super) fn validate_vhosts(config: &mut ProxyConfig) -> Result<()> {
             ));
         }
         validate_decoy(vhost_idx, &vhost.decoy)?;
+        if vhost
+            .carrier_method
+            .unwrap_or(config.web.carrier_method)
+            .is_get()
+        {
+            get_carrier_hosts = true;
+            if !crate::config::get_url_host_fits(&vhost.host, &vhost.base_path, limits) {
+                return config_error(&format!(
+                    "web.vhosts[{vhost_idx}] host/base_path leaves no room for GET carrier data within web.limits.get_url_bytes"
+                ));
+            }
+        }
         let mut profiles = HashSet::with_capacity(vhost.profiles.len());
         for (profile_idx, profile) in vhost.profiles.iter().enumerate() {
             if profile.user.is_empty() || profile.user.len() > 64 {
@@ -72,6 +86,17 @@ pub(super) fn validate_vhosts(config: &mut ProxyConfig) -> Result<()> {
                 ProxyError::Config("WEB profile count overflowed usize".to_string())
             })?;
         }
+    }
+    if get_carrier_hosts
+        && config
+            .web
+            .carrier_candidates()
+            .iter()
+            .any(|carrier| carrier.uses_websocket())
+    {
+        return config_error(
+            "GET carrier_method hosts require web.carrier and web.carriers without WebSocket candidates",
+        );
     }
     if profile_count > limits.max_profiles {
         return config_error("WEB profiles exceed web.limits.max_profiles");

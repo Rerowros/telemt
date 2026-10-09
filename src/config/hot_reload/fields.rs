@@ -360,6 +360,9 @@ pub(super) fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyC
     if !web_debug_fits_limits(&cfg.web.debug, &cfg.web.limits) {
         cfg.web.debug = old.web.debug.clone();
     }
+    if !cfg.web.get_carrier_fits_limits() {
+        cfg.web = old.web.clone();
+    }
     if cfg.rebuild_runtime_user_auth().is_err() {
         cfg.runtime_user_auth = None;
     }

@@ -37,8 +37,8 @@ function create(settings){
   owner.controller.signal.addEventListener('abort',abort,{once:true});
   const timer=setTimeout(abort,Math.max(1,Math.min(settings.requestMs(),left)));
   try{
-   const token=settings.token();
-   const response=await fetch(settings.url(),{
+   const token=settings.token(),nonce=settings.nonce?settings.nonce():'',target=nonce?settings.url()+'&n='+nonce:settings.url();
+   const response=await fetch(target,{
     method:'GET',signal:requestController.signal,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
     headers:Object.assign({Accept:mediaType},token?{Authorization:'Bearer '+token}:{})
    });

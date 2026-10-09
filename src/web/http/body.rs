@@ -163,3 +163,21 @@ pub(super) async fn collect_body(
         _body_budget: body_budget,
     })
 }
+
+/// Wraps one already-decoded GET payload in the canonical collected-body shape.
+/// The byte lease is freshly reserved for the decoded bytes so GET and legacy
+/// transports share one accounting rule.
+pub(super) fn collected_from_get(
+    request: Request<RequestBody>,
+    body: Bytes,
+    runtime: &WebProcessRuntime,
+) -> Option<CollectedBody> {
+    let (parts, _) = request.into_parts();
+    let (reader_budget, body_budget) = runtime.try_body_budget(body.len())?;
+    drop(reader_budget);
+    Some(CollectedBody {
+        request: Request::from_parts(parts, Empty::new()),
+        body,
+        _body_budget: body_budget,
+    })
+}

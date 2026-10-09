@@ -7,6 +7,10 @@ mod base_path_tests;
 #[path = "web_tests/carrier_method_tests.rs"]
 mod carrier_method_tests;
 
+// GET carrier limits, overrides, and WebSocket-candidate fences stay scoped.
+#[path = "web_tests/get_carrier_tests.rs"]
+mod get_carrier_tests;
+
 #[path = "web_tests/conveyor_tests.rs"]
 mod conveyor_tests;
 #[path = "web_tests/decoy_dns_tests.rs"]

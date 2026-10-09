@@ -81,6 +81,9 @@ pub struct WebVhostConfig {
     /// Optional canonical WEB endpoint prefix without surrounding slashes.
     #[serde(default)]
     pub base_path: String,
+    /// Optional HTTPS carrier method override for this hostname.
+    #[serde(default)]
+    pub carrier_method: Option<WebCarrierMethod>,
     /// Stable public destination tuple used by inner relay routing and KDF metadata.
     pub public_addr: SocketAddr,
     /// Ordinary-site fallback for this hostname.
@@ -99,6 +102,10 @@ pub struct WebLimitsConfig {
     /// Maximum collected carrier request body size.
     #[serde(default = "default_web_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Maximum full absolute URL bytes (scheme, host, request-target) for GET
+    /// carrier requests.
+    #[serde(default = "default_web_get_url_bytes")]
+    pub get_url_bytes: usize,
     /// Maximum payload carried by one WEB frame.
     #[serde(default = "default_web_max_frame_payload_bytes")]
     pub max_frame_payload_bytes: usize,
@@ -241,6 +248,7 @@ impl Default for WebLimitsConfig {
         Self {
             max_header_bytes: default_web_max_header_bytes(),
             max_body_bytes: default_web_max_body_bytes(),
+            get_url_bytes: default_web_get_url_bytes(),
             max_frame_payload_bytes: default_web_max_frame_payload_bytes(),
             carrier_batch_bytes: default_web_carrier_batch_bytes(),
             max_frames_per_body: default_web_max_frames_per_body(),
@@ -415,6 +423,39 @@ pub enum WebCarrierNegotiationAggressiveness {
     Aggressive,
 }
 
+// Worst-case encoded GET query metadata: credentials, counters, carrier
+// headers, lane/sequence fields, and part indexes plus key separators.
+pub(crate) const GET_URL_METADATA_BYTES: usize = 320;
+
+/// Maximum fragment count accepted for one GET uplink operation.
+pub(crate) const GET_MAX_PARTS: u32 = 4096;
+
+/// Worst-case URL bytes one GET host reserves before any payload data:
+/// absolute `https://` origin, base path, longest route, and query metadata.
+pub(crate) fn get_url_reserved_bytes(host: &str, base_path: &str) -> usize {
+    "https://".len()
+        + host.len()
+        + base_path.len().saturating_add(2)
+        + "api/v1/session".len()
+        + 1
+        + GET_URL_METADATA_BYTES
+        + 2
+}
+
+/// Returns whether one GET host fits the URL budget and can still send the
+/// configured carrier batch through at most [`GET_MAX_PARTS`] fragments.
+pub(crate) fn get_url_host_fits(host: &str, base_path: &str, limits: &WebLimitsConfig) -> bool {
+    let Some(space) = limits
+        .get_url_bytes
+        .checked_sub(get_url_reserved_bytes(host, base_path))
+    else {
+        return false;
+    };
+    // Each fragment carries floor(space/4)*3 raw bytes in canonical base64url.
+    let per_part = space / 4 * 3;
+    per_part >= 1 && limits.carrier_batch_bytes <= per_part.saturating_mul(GET_MAX_PARTS as usize)
+}
+
 /// WEB ingress, carrier, fallback, and lifecycle configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConfig {
@@ -483,6 +524,36 @@ impl WebConfig {
     /// Returns whether the explicit candidate list enables auto-negotiation.
     pub(crate) fn carrier_negotiation_enabled(&self) -> bool {
         self.carriers.enabled().is_some()
+    }
+
+    /// Resolves the effective HTTPS carrier method for one canonical host.
+    pub(crate) fn effective_carrier_method(&self, host: &str) -> WebCarrierMethod {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vhosts.get(host))
+            .and_then(|vhost| vhost.carrier_method)
+            .unwrap_or(self.carrier_method)
+    }
+
+    /// Returns whether effective GET hosts fit the restart-only URL budget
+    /// and never negotiate WebSocket candidates they cannot drive.
+    pub(crate) fn get_carrier_fits_limits(&self) -> bool {
+        // With no vhosts the global method is the effective method for any host.
+        let mut any_get = self.vhosts.is_empty() && self.carrier_method.is_get();
+        for vhost in &self.vhosts {
+            if !vhost.carrier_method.unwrap_or(self.carrier_method).is_get() {
+                continue;
+            }
+            any_get = true;
+            if !get_url_host_fits(&vhost.host, &vhost.base_path, &self.limits) {
+                return false;
+            }
+        }
+        !any_get
+            || self
+                .carrier_candidates()
+                .iter()
+                .all(|carrier| !carrier.uses_websocket())
     }
 }
 

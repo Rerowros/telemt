@@ -29,8 +29,33 @@ impl BridgeCandidate {
 
 /// Decodes an exact canonical bridge query without allocating credential strings.
 pub(super) fn bridge_candidate(query: Option<&str>) -> BridgeCandidate {
-    let Some(value) = query.and_then(|query| query.strip_prefix("bridge=")) else {
+    bridge_candidate_inner(query, false)
+}
+
+/// Decodes the recovery bridge query permitting one canonical nonce suffix.
+pub(super) fn bridge_candidate_recovery(query: Option<&str>) -> BridgeCandidate {
+    bridge_candidate_inner(query, true)
+}
+
+fn bridge_candidate_inner(query: Option<&str>, allow_nonce: bool) -> BridgeCandidate {
+    let Some(rest) = query.and_then(|query| query.strip_prefix("bridge=")) else {
         return BridgeCandidate::NonCanonical;
+    };
+    let value = match rest.split_once('&') {
+        None => rest,
+        Some((value, suffix)) => {
+            let Some(nonce) = allow_nonce.then(|| suffix.strip_prefix("n=")).flatten() else {
+                return BridgeCandidate::NonCanonical;
+            };
+            if nonce.is_empty()
+                || nonce == "0"
+                || (nonce.len() > 1 && nonce.starts_with('0'))
+                || !nonce.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return BridgeCandidate::NonCanonical;
+            }
+            value
+        }
     };
     canonical_credential(value.as_bytes())
         .map(BridgeCandidate::Canonical)

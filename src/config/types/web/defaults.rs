@@ -41,6 +41,7 @@ macro_rules! u64_default {
 
 usize_default!(default_web_max_header_bytes, 16 * 1024);
 usize_default!(default_web_max_body_bytes, 2 * 1024 * 1024);
+usize_default!(default_web_get_url_bytes, 7168);
 usize_default!(default_web_max_frame_payload_bytes, 1024 * 1024);
 usize_default!(default_web_carrier_batch_bytes, 2 * 1024 * 1024);
 usize_default!(default_web_max_frames_per_body, 4096);

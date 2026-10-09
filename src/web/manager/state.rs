@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::{CarrierRequest, ProfileKey, TokenAuthenticator, TokenHash, TokenKind};
-use crate::config::{WebCarrier, WebRuntimeConfig, WebRuntimeProfile, WebTimeoutsConfig};
+use crate::config::{
+    WebCarrier, WebCarrierMethod, WebRuntimeConfig, WebRuntimeProfile, WebTimeoutsConfig,
+};
 use crate::maestro::generation::RuntimeGeneration;
 use crate::proxy::user_admission::UserSessionRegistration;
 use crate::web::session::WebSession;
@@ -65,6 +67,8 @@ pub(super) struct Bootstrap {
     pub(super) session: Option<Arc<WebSession>>,
     /// Metadata that defines exact attempt replay and candidate advancement.
     pub(super) carrier_request: Option<CarrierRequest>,
+    /// HTTPS carrier method frozen at issuance for this credential lineage.
+    pub(super) carrier_method: crate::config::WebCarrierMethod,
     /// Learning-ranked carrier order frozen by the first automatic attempt.
     pub(super) carrier_candidates: Arc<[WebCarrier]>,
     /// Weighted learning scores captured when the candidate order was frozen.
@@ -107,6 +111,8 @@ pub(super) struct ClosedToken {
     pub(super) host: String,
     /// Carrier that owned the retired bearer.
     pub(super) carrier: WebCarrier,
+    /// HTTPS carrier method frozen for the retired session.
+    pub(super) carrier_method: crate::config::WebCarrierMethod,
 }
 
 /// Current logical-session owner stored without exposing bearer credentials.
@@ -374,6 +380,7 @@ pub(super) fn remember_closed_token_locked(
     hash: TokenHash,
     host: &str,
     carrier: WebCarrier,
+    carrier_method: WebCarrierMethod,
     lifetime: Duration,
     capacity: usize,
 ) {
@@ -383,6 +390,7 @@ pub(super) fn remember_closed_token_locked(
             expires_at: Instant::now() + lifetime,
             host: host.to_string(),
             carrier,
+            carrier_method,
         },
     );
     while state.closed_tokens.len() > capacity {

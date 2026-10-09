@@ -220,6 +220,7 @@ impl WebProcessRuntime {
         let issued_profile = Arc::clone(&entry.profile);
         let issued_timeouts = entry.timeouts.clone();
         let recovery = entry.recovery;
+        let carrier_method = entry.carrier_method;
         let profile = config
             .web
             .runtime
@@ -363,6 +364,7 @@ impl WebProcessRuntime {
         } else {
             1
         });
+        session.configure_carrier_method(carrier_method);
         state.sessions.insert(session_hash, Arc::clone(&session));
         *state.sessions_per_ip.entry(client_ip).or_insert(0) += 1;
         *state.sessions_per_profile.entry(profile_key).or_insert(0) += 1;

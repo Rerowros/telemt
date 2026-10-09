@@ -51,15 +51,15 @@ pub use server::{
     ListenerConfig, ListenerTransport, ServerConfig, SynLimitMode, TimeoutsConfig,
     WebClientIpSource,
 };
+pub(crate) use web::{
+    GET_MAX_PARTS, WebDecoyDnsSnapshot, WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile,
+    WebRuntimeVhost, WebStaticAsset, WebStaticSite, get_url_host_fits,
+};
 #[allow(unused_imports)]
 pub use web::{
     WebCarrierNegotiationAggressiveness, WebConfig, WebDecoyConfig, WebDecoyFastTrackMode,
     WebDecoyResolve, WebHttpConnectionCapacityAction, WebLimitsConfig, WebProfileConfig,
     WebSecretMode, WebTimeoutsConfig, WebVhostConfig,
-};
-pub(crate) use web::{
-    WebDecoyDnsSnapshot, WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost,
-    WebStaticAsset, WebStaticSite,
 };
 pub(crate) use web_carrier::WEB_CARRIER_LEARNING_MIN_ENTRIES;
 #[allow(unused_imports)]

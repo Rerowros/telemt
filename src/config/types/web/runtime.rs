@@ -18,6 +18,8 @@ pub(crate) struct WebRuntimeVhost {
     pub(crate) host: String,
     /// Exact slash-delimited endpoint base, including the trailing slash.
     pub(crate) base: String,
+    /// Optional HTTPS carrier method override for this hostname.
+    pub(crate) carrier_method: Option<crate::config::WebCarrierMethod>,
     /// Restart-frozen decoy capability-scan policy.
     pub(crate) decoy_fasttrack_mode: WebDecoyFastTrackMode,
     /// Immutable ordinary-site fallback snapshot.

@@ -12,6 +12,8 @@ pub enum WebCarrierMethod {
     Post,
     /// Allow idempotent-method connection reuse in Linux WebKitGTK.
     Put,
+    /// Move all carrier payloads into bounded GET query parameters.
+    Get,
 }
 
 impl WebCarrierMethod {
@@ -20,7 +22,13 @@ impl WebCarrierMethod {
         match self {
             Self::Post => "POST",
             Self::Put => "PUT",
+            Self::Get => "GET",
         }
+    }
+
+    /// Returns whether the bridge emits only GET requests for this method.
+    pub(crate) const fn is_get(self) -> bool {
+        matches!(self, Self::Get)
     }
 }
 

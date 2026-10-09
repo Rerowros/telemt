@@ -1,0 +1,137 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>telemt GET e2e parent</title>
+<script>
+"use strict";
+// Parent page for the GET-carrier browser fixture. It embeds the generated
+// bridge page over the GET-only edge, hands it a MessageChannel port through
+// tproxy-init, then exchanges native WEB frames. All state is exposed on
+// window.__e2e for the Playwright driver; no credentials are logged.
+const params = new URLSearchParams(location.search);
+const BRIDGE_ORIGIN = params.get("origin") || "https://proxy.example.com";
+const CAP = params.get("cap") || "";
+const BASE = params.get("base") || "/";
+
+const state = {
+  status: "init",
+  welcome: null,
+  frames: [],
+  downData: [],
+  downBytes: 0,
+  traffic: { up: 0, down: 0 },
+  closed: false,
+  port: null,
+  iframe: null,
+};
+window.__e2e = state;
+
+function decodeFrames(buffer) {
+  const u8 = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  const frames = [];
+  let offset = 0;
+  while (offset + 8 <= u8.length) {
+    const type = u8[offset];
+    const sid = (u8[offset + 1] << 16) | (u8[offset + 2] << 8) | u8[offset + 3];
+    const len = ((u8[offset + 4] << 24) | (u8[offset + 5] << 16) |
+      (u8[offset + 6] << 8) | u8[offset + 7]) >>> 0;
+    if (offset + 8 + len > u8.length) break;
+    frames.push({ type, sid, payload: u8.slice(offset + 8, offset + 8 + len) });
+    offset += 8 + len;
+  }
+  return frames;
+}
+
+function encodeFrame(type, sid, payload) {
+  const len = payload ? payload.length : 0;
+  const out = new Uint8Array(8 + len);
+  out[0] = type;
+  out[1] = (sid >> 16) & 255;
+  out[2] = (sid >> 8) & 255;
+  out[3] = sid & 255;
+  out[4] = (len >>> 24) & 255;
+  out[5] = (len >>> 16) & 255;
+  out[6] = (len >>> 8) & 255;
+  out[7] = len & 255;
+  if (len) out.set(payload, 8);
+  return out;
+}
+
+state.start = () => new Promise((resolve, reject) => {
+  const iframe = document.createElement("iframe");
+  iframe.src = BRIDGE_ORIGIN + BASE + "?bridge=" + CAP;
+  const timer = setTimeout(() => reject(new Error("iframe load timeout")), 30000);
+  iframe.onload = () => {
+    clearTimeout(timer);
+    const channel = new MessageChannel();
+    state.port = channel.port1;
+    channel.port1.onmessage = (event) => {
+      const data = event.data;
+      if (data instanceof ArrayBuffer) {
+        if (state.welcome === null) {
+          state.welcome = data;
+        } else {
+          for (const frame of decodeFrames(data)) {
+            state.frames.push({ type: frame.type, sid: frame.sid, len: frame.payload.length });
+            if (frame.type === 2) {
+              state.downBytes += frame.payload.length;
+              state.downData.push(frame.payload);
+            }
+          }
+        }
+      } else if (data && data.t === "status") {
+        state.status = data.state;
+      } else if (data && data.t === "traffic") {
+        state.traffic.up += data.up;
+        state.traffic.down += data.down;
+      } else if (data && data.t === "close") {
+        state.closed = true;
+      }
+    };
+    channel.port1.start();
+    state.iframe = iframe;
+    iframe.contentWindow.postMessage({ t: "tproxy-init", v: 1 }, BRIDGE_ORIGIN, [channel.port2]);
+    resolve();
+  };
+  document.body.appendChild(iframe);
+});
+
+state.send = (bytes) => {
+  const buffer = bytes instanceof Uint8Array ? bytes.buffer.slice(0) : bytes;
+  state.port.postMessage(buffer, [buffer]);
+};
+state.sendFrame = (type, sid, payload) => {
+  const bytes = encodeFrame(type, sid, payload);
+  state.port.postMessage(bytes.buffer, [bytes.buffer]);
+};
+state.hello = () => state.sendFrame(0x10, 0, new Uint8Array([1]));
+state.open = (sid) => state.sendFrame(0x01, sid, null);
+state.data = (sid, u8) => state.sendFrame(0x02, sid, u8);
+state.closeSession = () => state.port.postMessage({ t: "close" });
+
+state.waitFor = (fn, timeoutMs) => new Promise((resolve, reject) => {
+  const deadline = Date.now() + timeoutMs;
+  const tick = () => {
+    let value;
+    try { value = fn(); } catch (error) { value = null; }
+    if (value) { resolve(value); return; }
+    if (Date.now() > deadline) { reject(new Error("waitFor timeout")); return; }
+    setTimeout(tick, 50);
+  };
+  tick();
+});
+
+state.makePayload = (n) => {
+  const u8 = new Uint8Array(n);
+  for (let i = 0; i < n; i++) u8[i] = (i * 31 + 7) & 255;
+  return u8;
+};
+state.collectData = () => {
+  const total = state.downData.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of state.downData) { out.set(part, offset); offset += part.length; }
+  return out;
+};
+state.resetDown = () => { state.downData = []; state.downBytes = 0; state.frames = []; };
+</script>
+<body>telemt GET e2e parent</body>

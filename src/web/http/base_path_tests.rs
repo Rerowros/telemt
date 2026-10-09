@@ -400,6 +400,7 @@ async fn prefixed_decoy_request_keeps_its_original_path_and_query() {
     let vhost = Arc::new(WebRuntimeVhost {
         host: "proxy.example.com".to_string(),
         base: "/relay/".to_string(),
+        carrier_method: None,
         decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
         decoy: WebRuntimeDecoy::HttpUpstream {
             addr: site_addr,

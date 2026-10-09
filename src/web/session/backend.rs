@@ -66,6 +66,18 @@ impl WebSession {
                 None,
             );
             let logical_stream = WebLogicalStream::new(Arc::clone(&session), stream);
+            #[cfg(test)]
+            if std::env::var_os("TELEMT_WEB_GET_E2E_ECHO").is_some() {
+                // Browser-fixture escape: the logical stream is mirrored back so
+                // the GET carrier roundtrip can be measured end to end without
+                // standing up an inner MTProto handshake in the test client.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    _ = echo_stream(logical_stream) => {}
+                }
+                return;
+            }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {}
@@ -387,4 +399,23 @@ async fn run_stream(
             "error"
         }),
     );
+}
+
+/// Test-only fixture backend: echoes every logical-stream byte back to the
+/// browser client so carrier behaviour can be verified without a DC upstream.
+#[cfg(test)]
+async fn echo_stream(stream: WebLogicalStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if writer.write_all(&buffer[..read]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }

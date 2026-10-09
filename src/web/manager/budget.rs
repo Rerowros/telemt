@@ -371,6 +371,37 @@ impl WebProcessRuntime {
         Some((reader, body))
     }
 
+    /// Reserves one body reader for a physical request without byte capacity.
+    pub(crate) fn try_body_reader(&self) -> Option<OwnedSemaphorePermit> {
+        let Some(reader) = Arc::clone(&self.body_readers).try_acquire_owned().ok() else {
+            self.record_limit_hit();
+            self.telemetry
+                .record_rejection(WebRejectionReason::BodyReaderCapacity);
+            return None;
+        };
+        Some(reader)
+    }
+
+    /// Reserves global body bytes for retained GET reassembly without a reader.
+    pub(crate) fn try_body_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let Some(bytes) = u32::try_from(bytes).ok() else {
+            self.record_limit_hit();
+            self.telemetry
+                .record_rejection(WebRejectionReason::BodyBytesCapacity);
+            return None;
+        };
+        let Some(lease) = Arc::clone(&self.body_bytes)
+            .try_acquire_many_owned(bytes)
+            .ok()
+        else {
+            self.record_limit_hit();
+            self.telemetry
+                .record_rejection(WebRejectionReason::BodyBytesCapacity);
+            return None;
+        };
+        Some(lease)
+    }
+
     /// Reserves transient bytes while one downlink batch replaces queued frames.
     pub(crate) fn try_downlink_staging_budget(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let bytes = u32::try_from(bytes).ok()?;

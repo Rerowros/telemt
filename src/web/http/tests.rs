@@ -52,6 +52,12 @@ mod decoy_fasttrack_tests;
 // Base-path routing and credential containment share reference-contract coverage.
 #[path = "base_path_tests.rs"]
 mod base_path_tests;
+// Strict GET carrier normalization stays separate from legacy method coverage.
+#[path = "get_tests.rs"]
+mod get_tests;
+// The external browser fixture stays ignored and separate from unit coverage.
+#[path = "e2e_get_tests.rs"]
+mod e2e_get_tests;
 // Raw response parsing helpers are shared by the HTTP integration test modules.
 #[path = "response_test_support.rs"]
 mod response_test_support;
@@ -158,6 +164,7 @@ fn runtime_config_with_carriers_and_deadlines(
     let vhost = Arc::new(WebRuntimeVhost {
         host: "proxy.example.com".to_string(),
         base: base.to_string(),
+        carrier_method: None,
         decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
         decoy: WebRuntimeDecoy::StaticDirectory(Arc::clone(&site)),
         decoy_header_secs: 1,
@@ -171,6 +178,7 @@ fn runtime_config_with_carriers_and_deadlines(
         Arc::new(WebRuntimeVhost {
             host: "other.example.com".to_string(),
             base: "/".to_string(),
+            carrier_method: None,
             decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
             decoy: WebRuntimeDecoy::StaticDirectory(site),
             decoy_header_secs: 1,

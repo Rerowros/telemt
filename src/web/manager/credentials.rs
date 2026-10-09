@@ -15,6 +15,17 @@ use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::{SessionCloseReason, WebSession};
 use crate::web::telemetry::{WebBridgeRecoveryEvent, WebRejectionReason};
 
+/// Operation class deciding which credential store authenticates a GET token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetTokenScope {
+    /// Session creation and diagnostics resolve the issuing bootstrap.
+    Bootstrap,
+    /// Uplink and downlink requests resolve the live session.
+    Session,
+    /// Close resolves a live session or a bounded closed-token tombstone.
+    Close,
+}
+
 impl WebProcessRuntime {
     /// Issues a one-use bootstrap credential for an active compatible profile.
     #[cfg(test)]
@@ -165,6 +176,13 @@ impl WebProcessRuntime {
         let trace_session_id = self.trace.next_session_id();
         let bridge_diagnostics_enabled = config.web.debug.bridge_diagnostics_enabled();
         let (user_agent, user_agent_id) = bounded_user_agent(user_agent);
+        // Recovery preserves the surviving page's frozen method so a GET page
+        // keeps its carrier policy after a global rollback.
+        let carrier_method = predecessor_session_id
+            .and_then(|session_id| state.session_index.get(&session_id))
+            .and_then(|index| state.sessions.get(&index.session_hash))
+            .map(|session| session.carrier_method())
+            .unwrap_or_else(|| config.web.effective_carrier_method(&profile.host));
         let issued_profile = Arc::clone(&profile);
         state.bootstraps.insert(
             hash,
@@ -184,6 +202,7 @@ impl WebProcessRuntime {
                 session_token: Zeroizing::new(String::new()),
                 session: None,
                 carrier_request: None,
+                carrier_method,
                 carrier_candidates: Arc::from([]),
                 carrier_scores: [0; 4],
                 carrier_attempt: 0,
@@ -269,6 +288,58 @@ impl WebProcessRuntime {
                     ),
                 )
             })
+    }
+
+    /// Returns whether one host-bound credential may drive the GET carrier.
+    /// The token must authenticate against the credential store matching the
+    /// operation before the active or issuance-frozen method permits GET.
+    pub(crate) fn get_carrier_allowed(
+        &self,
+        hash: TokenHash,
+        host: &str,
+        scope: GetTokenScope,
+    ) -> bool {
+        let now = Instant::now();
+        let frozen = {
+            let state = self.state.lock();
+            let session_method = state
+                .sessions
+                .get(&hash)
+                .filter(|session| session.matches_host(host))
+                .map(|session| session.carrier_method());
+            let bootstrap_method = state
+                .bootstraps
+                .get(&hash)
+                .filter(|entry| {
+                    entry.profile.host == host
+                        && now <= entry.expires_at
+                        && !entry.user_registration.is_cancelled()
+                })
+                .map(|entry| entry.carrier_method);
+            let closed_method = state
+                .closed_tokens
+                .get(&hash)
+                .filter(|closed| closed.host == host && now <= closed.expires_at)
+                .map(|closed| closed.carrier_method);
+            match scope {
+                GetTokenScope::Bootstrap => bootstrap_method.or(session_method),
+                GetTokenScope::Session => session_method,
+                GetTokenScope::Close => session_method.or(closed_method),
+            }
+        };
+        // A resolved credential permits GET when its frozen method or the
+        // currently effective method allows it; unknown tokens stay decoy.
+        if frozen.is_none() {
+            return false;
+        }
+        if frozen == Some(crate::config::WebCarrierMethod::Get) {
+            return true;
+        }
+        self.active_generation()
+            .config()
+            .web
+            .effective_carrier_method(host)
+            .is_get()
     }
 
     /// Resolves an authenticated session token.

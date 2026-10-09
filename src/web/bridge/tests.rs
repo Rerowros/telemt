@@ -56,8 +56,45 @@ fn carrier_method_is_page_owned_and_used_by_every_https_request() {
     }
 }
 
+#[test]
+fn get_carrier_page_executes_query_encoded_requests_on_every_route() {
+    for diagnostics in [false, true] {
+        let page = render_with_get_url(
+            "proxy.example.com",
+            "/",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            2 * 1024 * 1024,
+            32 * 1024 * 1024,
+            16 * 1024,
+            1024,
+            true,
+            4,
+            [3, 5, 8, 12],
+            25,
+            10,
+            90,
+            15,
+            15,
+            120,
+            0,
+            diagnostics,
+            WebCarrierMethod::Get,
+            7168,
+            &SecureRandom::new(),
+        );
+        assert!(!page.body.contains("__"));
+        assert!(page.body.contains("const carrierMethod='GET';"));
+        // The nonce guard and the part-count cap are page-owned invariants.
+        assert!(page.body.contains("Number.MAX_SAFE_INTEGER"));
+        assert!(page.body.contains("4096"));
+        get_tests::run(&page);
+    }
+}
+
 #[path = "behavior_tests.rs"]
 mod behavior_tests;
+#[path = "get_tests.rs"]
+mod get_tests;
 
 fn render_page(bootstrap: &str, candidate_count: usize) -> BridgePage {
     render(

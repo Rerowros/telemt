@@ -15,6 +15,7 @@ enum RetainedSessionResource {
     Batch(DownBatch),
     StagingPermit(OwnedSemaphorePermit),
     Stream(StreamState),
+    GetFragments(super::get_fragments::GetFragments),
 }
 
 struct DeferredItems<T> {
@@ -102,6 +103,12 @@ impl DeferredSessionEffects {
         self.retained.push(RetainedSessionResource::Stream(stream));
     }
 
+    /// Retains detached GET fragment leases for a post-unlock drop.
+    pub(super) fn retain_get_fragments(&mut self, fragments: super::get_fragments::GetFragments) {
+        self.retained
+            .push(RetainedSessionResource::GetFragments(fragments));
+    }
+
     /// Drops retained ownership first, then dispatches callbacks in FIFO order.
     pub(super) fn finish(self) {
         for retained in self.retained.into_iter() {
@@ -109,6 +116,7 @@ impl DeferredSessionEffects {
                 RetainedSessionResource::Batch(batch) => drop(batch),
                 RetainedSessionResource::StagingPermit(permit) => drop(permit),
                 RetainedSessionResource::Stream(stream) => drop(stream),
+                RetainedSessionResource::GetFragments(fragments) => drop(fragments),
             }
         }
         for callback in self.callbacks.into_iter() {
