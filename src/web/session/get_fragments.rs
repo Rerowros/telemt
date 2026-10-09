@@ -110,8 +110,17 @@ impl GetFragments {
             .count()
     }
 
-    /// Detaches completed records the client already confirmed for one lane.
+    /// Detaches every record the client already confirmed for one lane: the
+    /// completed ones and replay assemblies of applied sequences, which no
+    /// client will finish once it confirmed them.
     fn confirm_lane(&mut self, lane: Option<u32>, confirmed: u64, retired: &mut GetFragments) {
+        for (key, assembly) in self
+            .pending
+            .extract_if(|(owner, sequence), _| owner == &lane && *sequence <= confirmed)
+        {
+            self.committed_bytes = self.committed_bytes.saturating_sub(assembly.commitment);
+            retired.pending.insert(key, assembly);
+        }
         for (key, completed) in self
             .completed
             .extract_if(|(owner, sequence), _| owner == &lane && *sequence <= confirmed)

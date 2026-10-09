@@ -274,6 +274,7 @@ impl WebSession {
             // A valid new sequence retires the completed records it
             // supersedes before the per-lane record bound applies.
             if let Some(hint) = confirmed {
+                state.conveyor.confirm(lane_id, hint);
                 state
                     .get_fragments
                     .confirm_lane(lane_id, hint, &mut retired);

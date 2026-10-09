@@ -390,3 +390,82 @@ async fn get_sessions_together_leave_the_post_reserve() {
 
     manager.shutdown().await;
 }
+
+/// Applies `sequence` as one two-part operation on the shared channel.
+async fn apply_two_parts(session: &Arc<WebSession>, sequence: u64, hint: u64) {
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    let head = pong.iter().copied().cycle().take(32).collect::<Bytes>();
+    assert!(matches!(
+        session.offer_get_up(None, sequence, Some(hint), 0, 2, head),
+        Ok(GetUpOffer::Pending(0))
+    ));
+    let Ok(GetUpOffer::Complete { body, .. }) =
+        session.offer_get_up(None, sequence, Some(hint), 1, 2, pong)
+    else {
+        panic!("final part completes the two-part operation");
+    };
+    let claim = session
+        .claim_conveyor(None, sequence, Some(hint))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.process(&body).await, Ok(sequence));
+}
+
+/// Opens later operations with the given hint and reports how far the
+/// four-deep window filled.
+fn open_window(session: &Arc<WebSession>, sequences: std::ops::RangeInclusive<u64>, hint: u64) {
+    let part = Bytes::from_static(&[9u8; 32]);
+    for sequence in sequences {
+        let offer = session.offer_get_up(None, sequence, Some(hint), 0, 2, part.clone());
+        assert!(
+            matches!(offer, Ok(GetUpOffer::Pending(0))),
+            "seq={sequence} must open"
+        );
+    }
+}
+
+/// A late duplicate part of a sequence the client already confirmed (its
+/// original stalled and was reissued) cannot park a record that blocks the
+/// conveyor window.
+#[tokio::test]
+async fn late_part_after_confirmation_never_blocks_the_window() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    apply_two_parts(&session, 1, 0).await;
+    // The next operation confirms sequence 1.
+    open_window(&session, 2..=2, 1);
+    // The stalled original part 0 of sequence 1 arrives with its old hint.
+    let head = Bytes::from_static(&[9u8; 32]);
+    let late = session.offer_get_up(None, 1, Some(0), 0, 2, head);
+    assert!(
+        matches!(late, Err(GetUpReject::Decoy)),
+        "late part is stale"
+    );
+    // The window still fills to its four records.
+    open_window(&session, 3..=5, 1);
+
+    manager.shutdown().await;
+}
+
+/// A replay record opened before the confirmation retires with it.
+#[tokio::test]
+async fn confirmation_retires_an_open_replay_record() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    apply_two_parts(&session, 1, 0).await;
+    // Expire the completed record so the late part opens a replay record.
+    let expired = Instant::now() + Duration::from_secs(95);
+    touch_peer_at(&session, expired);
+    assert!(!session.close_if_due(expired));
+    let head = Bytes::from_static(&[9u8; 32]);
+    let late = session.offer_get_up(None, 1, Some(0), 0, 2, head);
+    assert!(matches!(late, Ok(GetUpOffer::Pending(0))));
+    // Confirming sequence 1 retires that record: four new ones still fit.
+    open_window(&session, 2..=5, 1);
+    assert_eq!(
+        committed_bytes(&session),
+        4 * (64 + 2 * GET_PART_META_BYTES)
+    );
+
+    manager.shutdown().await;
+}
