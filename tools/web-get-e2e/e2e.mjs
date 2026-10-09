@@ -371,12 +371,24 @@ async function bench(method, rttMs, edge, label) {
     const idle = await page.evaluate(() =>
       window.__e2e.bench.ping(13, 25, 32, 120000),
     );
-    const load = await page.evaluate(async () => {
-      const upload = window.__e2e.bench.upload(14, 1024 * 1024, 300000);
+    // The load upload is sized to outlast the ping series: with a fast
+    // uplink a fixed 1 MiB finishes early and the tail of the series then
+    // measures an idle carrier. Slow uplinks keep the original 1 MiB; the
+    // cap stays below the initial 4 MiB stream window like the upload above.
+    const pingSeriesMs = 25 * percentiles(idle).p50;
+    const loadBytes = Math.min(
+      3.5 * 1024 * 1024,
+      Math.max(
+        1024 * 1024,
+        Math.ceil((up.bytes / up.ms) * pingSeriesMs * 1.5),
+      ),
+    );
+    const load = await page.evaluate(async (total) => {
+      const upload = window.__e2e.bench.upload(14, total, 300000);
       const times = await window.__e2e.bench.ping(15, 25, 32, 120000);
       await upload;
       return times;
-    });
+    }, loadBytes);
     await page.evaluate(() => window.__e2e.closeSession());
 
     result.uplink = {
@@ -392,6 +404,12 @@ async function bench(method, rttMs, edge, label) {
     };
     result.pingIdle = percentiles(idle);
     result.pingLoad = percentiles(load);
+    result.loadBytes = loadBytes;
+    // Raw samples keep p95 outliers attributable across repeated cells.
+    result.pingSamples = {
+      idle: idle.map((ms) => Math.round(ms)),
+      load: load.map((ms) => Math.round(ms)),
+    };
     const api = audit.filter((e) => e.path.includes("/api/"));
     result.audit = {
       requests: audit.length,
