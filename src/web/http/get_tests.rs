@@ -4,6 +4,8 @@
 // - reassembly: fragment admission, replay, and sequencing bounds
 // - conveyor: confirmed-window floors and out-of-order completion
 // - normalization: canonical query shape, credentials, and leak fences
+// - parallel: out-of-order non-final parts and fixed-chunk final gating
+// - commitment: window-scaled session caps, eviction, and POST isolation
 
 use std::sync::Arc;
 
@@ -17,10 +19,14 @@ use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::WebProcessRuntime;
 
+#[path = "get_tests/commitment.rs"]
+mod commitment;
 #[path = "get_tests/conveyor.rs"]
 mod conveyor;
 #[path = "get_tests/normalization.rs"]
 mod normalization;
+#[path = "get_tests/parallel.rs"]
+mod parallel;
 #[path = "get_tests/reassembly.rs"]
 mod reassembly;
 

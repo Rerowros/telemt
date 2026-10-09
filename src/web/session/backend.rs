@@ -68,13 +68,13 @@ impl WebSession {
             let logical_stream = WebLogicalStream::new(Arc::clone(&session), stream);
             #[cfg(test)]
             if std::env::var_os("TELEMT_WEB_GET_E2E_ECHO").is_some() {
-                // Browser-fixture escape: the logical stream is mirrored back so
-                // the GET carrier roundtrip can be measured end to end without
-                // standing up an inner MTProto handshake in the test client.
+                // Browser-fixture escape: the logical stream is handled by the
+                // fixture backend so the carrier roundtrip can be measured end
+                // to end without standing up an inner MTProto handshake.
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {}
-                    _ = echo_stream(logical_stream) => {}
+                    _ = fixture_stream(logical_stream) => {}
                 }
                 return;
             }
@@ -401,12 +401,56 @@ async fn run_stream(
     );
 }
 
-/// Test-only fixture backend: echoes every logical-stream byte back to the
-/// browser client so carrier behaviour can be verified without a DC upstream.
+/// Test-only fixture backend selected by the first logical-stream byte so one
+/// fixture covers echo, uplink-sink, and downlink-source bench roles:
+/// `b's'` - the next 8 bytes are a big-endian count; that many payload bytes
+///          are consumed, then the same 8-byte header is returned as the ack;
+/// `b'r'` - the next 8 bytes are a big-endian count; that many deterministic
+///          bytes (byte i = (i*31+7)&0xff, the fixture pattern) are written;
+/// any other byte - byte echo including the marker (the original behavior).
 #[cfg(test)]
-async fn echo_stream(stream: WebLogicalStream) {
+async fn fixture_stream(stream: WebLogicalStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut marker = [0u8; 1];
+    if reader.read_exact(&mut marker).await.is_err() {
+        return;
+    }
+    if marker[0] == b's' || marker[0] == b'r' {
+        let mut header = [0u8; 8];
+        if reader.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let total = u64::from_be_bytes(header);
+        let mut buffer = vec![0u8; 64 * 1024];
+        if marker[0] == b's' {
+            let mut remaining = total;
+            while remaining > 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                if reader.read_exact(&mut buffer[..take]).await.is_err() {
+                    return;
+                }
+                remaining -= take as u64;
+            }
+            let _ = writer.write_all(&header).await;
+            return;
+        }
+        let mut sent = 0u64;
+        while sent < total {
+            let take = (total - sent).min(buffer.len() as u64) as usize;
+            for (offset, byte) in buffer[..take].iter_mut().enumerate() {
+                *byte = ((sent + offset as u64).wrapping_mul(31).wrapping_add(7) & 0xff) as u8;
+            }
+            if writer.write_all(&buffer[..take]).await.is_err() {
+                return;
+            }
+            sent += take as u64;
+        }
+        return;
+    }
+    if writer.write_all(&marker).await.is_err() {
+        return;
+    }
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         match reader.read(&mut buffer).await {

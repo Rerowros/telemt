@@ -402,6 +402,12 @@ impl WebProcessRuntime {
         Some(lease)
     }
 
+    /// Reports the free global body-byte capacity for accounting assertions.
+    #[cfg(test)]
+    pub(crate) fn body_bytes_available(&self) -> usize {
+        self.body_bytes.available_permits()
+    }
+
     /// Reserves transient bytes while one downlink batch replaces queued frames.
     pub(crate) fn try_downlink_staging_budget(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let bytes = u32::try_from(bytes).ok()?;

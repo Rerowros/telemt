@@ -402,6 +402,7 @@ async fn handle_root(
         config.web.debug.bridge_diagnostics_enabled(),
         config.web.effective_carrier_method(&vhost.host),
         config.web.limits.get_url_bytes,
+        config.web.limits.get_parallel_parts,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));

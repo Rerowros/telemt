@@ -148,6 +148,20 @@ async fn handle_get_up(
             insert_header(&mut response, get::up_part_header_name(), &part.to_string());
             return response;
         }
+        Ok(GetUpOffer::Duplicate) => {
+            // The sequence already applied: acknowledge the replay exactly like
+            // the canonical duplicate path without reprocessing any frames.
+            let mut response = carrier_empty(StatusCode::NO_CONTENT);
+            insert_header(&mut response, get::up_part_header_name(), &part.to_string());
+            if part == parts.total - 1 {
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-up-ack"),
+                    &operation.sequence.to_string(),
+                );
+            }
+            return response;
+        }
         Ok(GetUpOffer::Complete { body, budget }) => (body, budget),
         Err(GetUpReject::Busy) => return service_unavailable(),
         Err(GetUpReject::Decoy) => {
@@ -175,7 +189,9 @@ async fn handle_get_up(
             Some(deadline) => {
                 match deadline.lease_for(Duration::from_secs(session.timeouts().body_secs)) {
                     Some(lease) => Some(lease),
-                    None => return service_unavailable(),
+                    None => {
+                        return service_unavailable();
+                    }
                 }
             }
             None => None,

@@ -11,8 +11,18 @@ const BOOTSTRAP = "A".repeat(43),
   SESSION = "B".repeat(43),
   URL_BYTES = 7168;
 
-function renderedPage() {
-  if (process.argv.includes("--stdin")) return fs.readFileSync(0, "utf8");
+let stdinPage = null;
+function renderedPage(overrides = {}) {
+  if (process.argv.includes("--stdin")) {
+    if (stdinPage === null) stdinPage = fs.readFileSync(0, "utf8");
+    let page = stdinPage;
+    if (overrides.GET_PARALLEL_PARTS !== undefined)
+      page = page.replace(
+        /const getParallelParts=\d+;/,
+        `const getParallelParts=${overrides.GET_PARALLEL_PARTS};`,
+      );
+    return page;
+  }
   let page = fs.readFileSync(path.join(__dirname, "document.html"), "utf8");
   const modules = {
     RESPONSE: "response",
@@ -31,31 +41,35 @@ function renderedPage() {
   page = page.replace("__RUNTIME__", () =>
     fs.readFileSync(path.join(__dirname, "runtime.js"), "utf8"),
   );
-  const values = {
-    BOOTSTRAP,
-    HOST: "proxy.example.com",
-    BASE_PREFIX: "",
-    CARRIER_METHOD: "GET",
-    NEGOTIATION_ENABLED: "true",
-    CANDIDATE_COUNT: 4,
-    CARRIER_DEADLINES: "3,5,8,12",
-    LONG_POLL_SECS: 25,
-    BRIDGE_REQUEST_SECS: 10,
-    BRIDGE_RETRY_SECS: 90,
-    BRIDGE_RECOVERY_SECS: 15,
-    WEBSOCKET_OPEN_SECS: 15,
-    RECONNECT_GRACE_SECS: 120,
-    CARRIER_PROBE_COALESCE_MS: 0,
-    GET_URL_BYTES: URL_BYTES,
-    BATCH_LIMIT: 2097152,
-    QUEUE_LIMIT: 33554432,
-    QUEUE_ITEMS: 16384,
-    MAX_STREAMS: 1024,
-    STATUS_FUNCTION:
-      "state=>{if(port&&!closed)port.postMessage({t:'status',state})}",
-    HELLO_TIMEOUT_CALLBACK: "()=>fail('timeout')",
-    PAGEHIDE_CALLBACK: "()=>close(true)",
-  };
+  const values = Object.assign(
+    {
+      BOOTSTRAP,
+      HOST: "proxy.example.com",
+      BASE_PREFIX: "",
+      CARRIER_METHOD: "GET",
+      NEGOTIATION_ENABLED: "true",
+      CANDIDATE_COUNT: 4,
+      CARRIER_DEADLINES: "3,5,8,12",
+      LONG_POLL_SECS: 25,
+      BRIDGE_REQUEST_SECS: 10,
+      BRIDGE_RETRY_SECS: 90,
+      BRIDGE_RECOVERY_SECS: 15,
+      WEBSOCKET_OPEN_SECS: 15,
+      RECONNECT_GRACE_SECS: 120,
+      CARRIER_PROBE_COALESCE_MS: 0,
+      GET_URL_BYTES: URL_BYTES,
+      GET_PARALLEL_PARTS: 6,
+      BATCH_LIMIT: 2097152,
+      QUEUE_LIMIT: 33554432,
+      QUEUE_ITEMS: 16384,
+      MAX_STREAMS: 1024,
+      STATUS_FUNCTION:
+        "state=>{if(port&&!closed)port.postMessage({t:'status',state})}",
+      HELLO_TIMEOUT_CALLBACK: "()=>fail('timeout')",
+      PAGEHIDE_CALLBACK: "()=>close(true)",
+    },
+    overrides,
+  );
   return page.replace(/__([A-Z_]+)__;?/g, (all, key) =>
     key.startsWith("DIAGNOSTIC_") ? "" : String(values[key] ?? ""),
   );
@@ -92,7 +106,8 @@ async function flush() {
 }
 function environment(page) {
   let now = 1000,
-    nextTimer = 1;
+    nextTimer = 1,
+    resourceEntries = [];
   const timers = new Map(),
     events = new Map(),
     requests = [],
@@ -122,7 +137,10 @@ function environment(page) {
     location: { hash: "", pathname: "/", search: "?bridge=test" },
     history: { replaceState() {} },
     parent: {},
-    performance: { now: () => now },
+    performance: {
+      now: () => now,
+      getEntriesByType: () => resourceEntries,
+    },
     Date: class extends Date {
       static now() {
         return now;
@@ -185,6 +203,14 @@ function environment(page) {
   return {
     context,
     send,
+    setProtocol: (protocol) => {
+      resourceEntries = [
+        {
+          name: "https://proxy.example.com/api/v1/up",
+          nextHopProtocol: protocol,
+        },
+      ];
+    },
     pending,
     answer,
     received,
@@ -384,7 +410,8 @@ test("fragmented uplinks stay under the budget with ordered unique nonces", asyn
   await flush();
 });
 
-test("intermediate fragments reject acks, wrong indexes, and non-204 status", async (page) => {
+test("intermediate fragments reject acks, wrong indexes, and non-204 status", async () => {
+  const page = renderedPage({ GET_PARALLEL_PARTS: 1 });
   for (const invalid of ["ack", "index", "status"]) {
     const env = await session(page);
     const first = await fragmentedUp(env, new Array(8192).fill(3));
@@ -404,7 +431,8 @@ test("intermediate fragments reject acks, wrong indexes, and non-204 status", as
   }
 });
 
-test("a terminal intermediate response stops without sending remaining parts", async (page) => {
+test("a terminal intermediate response stops without sending remaining parts", async () => {
+  const page = renderedPage({ GET_PARALLEL_PARTS: 1 });
   const env = await session(page);
   const first = await fragmentedUp(env, new Array(8192).fill(5));
   env.answer(first, 404, null);
@@ -415,7 +443,8 @@ test("a terminal intermediate response stops without sending remaining parts", a
   await flush();
 });
 
-test("a lost physical part retries with a fresh nonce and identical data", async (page) => {
+test("a lost physical part retries with a fresh nonce and identical data", async () => {
+  const page = renderedPage({ GET_PARALLEL_PARTS: 1 });
   const env = await session(page);
   const first = await fragmentedUp(env, new Array(8192).fill(9));
   env.answer(first, 204, null, { "X-Up-Part": "0" });
@@ -634,6 +663,333 @@ test("a one-megabyte batch round-trips through ordered GET fragments", async (pa
     for (const byte of decode(query.get("d"))) reassembled.push(byte);
   }
   assert.deepEqual(new Uint8Array(reassembled), new Uint8Array(sent));
+  env.close();
+  await flush();
+});
+
+test("non-final parts fly K-wide and the final part waits for all acks", async () => {
+  const page = renderedPage({ GET_PARALLEL_PARTS: 3 });
+  const env = await session(page);
+  env.send(join(frame(1, 1), frame(2, 1, new Array(48 * 1024).fill(11))));
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(inflight().length, 3, "K workers run parts concurrently");
+  const total = Number(params(inflight()[0].url).get("pn"));
+  assert.ok(total > 4, "body must exceed the worker count");
+  for (let part = 0; part < total - 1; ) {
+    const request = inflight()[0];
+    assert.ok(request, "a worker is always in flight");
+    const index = Number(params(request.url).get("p"));
+    assert.equal(index, part, "parts issue in index order");
+    env.answer(request, 204, null, { "X-Up-Part": String(index) });
+    await flush();
+    part++;
+  }
+  const last = inflight().find(
+    (r) => params(r.url).get("p") === String(total - 1),
+  );
+  assert.ok(last, "final part issues after all non-final acks");
+  env.answer(last, 204, null, {
+    "X-Up-Ack": "1",
+    "X-Up-Part": String(total - 1),
+  });
+  await flush();
+  env.close();
+  await flush();
+});
+
+test("a terminal answer aborts siblings and returns the response", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 3 });
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(12)),
+    frame(2, 1, new Array(48 * 1024).fill(14)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    null,
+    null,
+  );
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(inflight().length, 3);
+  const total = Number(params(inflight()[0].url).get("pn"));
+  assert.ok(total > 4, "parts must outlast the terminal answer");
+  env.answer(inflight()[0], 404, null);
+  const response = await operation;
+  assert.equal(response.status, 404);
+  await flush();
+  const aborted = ups(env).filter(
+    (r) => !r.answered && r.options.signal.aborted,
+  );
+  assert.equal(aborted.length, 2, "sibling fetches abort on a terminal answer");
+  assert.ok(
+    !ups(env).some((r) => Number(params(r.url).get("p")) >= 3),
+    "no fresh part issued after the terminal answer",
+  );
+  env.close();
+  await flush();
+});
+
+test("one part retry keeps sibling parts flowing", async () => {
+  const page = renderedPage({ GET_PARALLEL_PARTS: 3 });
+  const env = await session(page);
+  env.send(join(frame(1, 1), frame(2, 1, new Array(48 * 1024).fill(13))));
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  const first = inflight()[0];
+  env.answer(first, 204, null, { "X-Up-Part": "0" });
+  await flush();
+  const failed = inflight()[0];
+  assert.equal(params(failed.url).get("p"), "1");
+  failed.answered = true;
+  failed.reject(new Error("lost"));
+  await flush();
+  assert.ok(
+    inflight().some((r) => params(r.url).get("p") !== "1"),
+    "siblings keep flowing during a part retry",
+  );
+  await env.tick(400);
+  const replay = inflight().find((r) => params(r.url).get("p") === "1");
+  assert.ok(replay, "part 1 retried");
+  assert.equal(params(replay.url).get("d"), params(failed.url).get("d"));
+  assert.notEqual(params(replay.url).get("n"), params(failed.url).get("n"));
+  env.close();
+  await flush();
+});
+
+test("a 503 fragment answer retries inside the same operation", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 3 });
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(15)),
+    frame(2, 1, new Array(48 * 1024).fill(16)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    null,
+    null,
+  );
+  operation.catch(() => {});
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  const busy = inflight()[0];
+  const part = params(busy.url).get("p");
+  const sessionsBefore = env.requests.filter(
+    (r) => pathname(r.url) === "/api/v1/session",
+  ).length;
+  env.answer(busy, 503, null);
+  await flush();
+  await env.tick(400);
+  await flush();
+  const retry = inflight().find((r) => params(r.url).get("p") === part);
+  assert.ok(retry, "a busy fragment retries inside the operation");
+  assert.notEqual(params(retry.url).get("n"), params(busy.url).get("n"));
+  assert.equal(
+    env.requests.filter((r) => pathname(r.url) === "/api/v1/session").length,
+    sessionsBefore,
+    "503 on a fragment never triggers a session recovery",
+  );
+  env.close();
+  await flush();
+});
+
+test("the h1.1 scheduler leaves connections for an active long poll", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 8 });
+  // One held GET down poll counts against the six-connection envelope.
+  const poll = requestClient.send(
+    "/api/v1/down",
+    requestClient.options(
+      "POST",
+      SESSION,
+      null,
+      { "X-Down-Cursor": "0" },
+      null,
+    ),
+    null,
+    1,
+    null,
+  );
+  poll.catch(() => {});
+  await flush();
+  assert.equal(env.pending("/api/v1/down").length, 1);
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(21)),
+    frame(2, 1, new Array(48 * 1024).fill(22)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    null,
+    null,
+  );
+  operation.catch(() => {});
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(
+    inflight().length,
+    3,
+    "cap is 6 - 1 long poll - 2 reserve despite K=8",
+  );
+  const request = inflight()[0];
+  env.answer(request, 204, null, {
+    "X-Up-Part": params(request.url).get("p"),
+  });
+  await flush();
+  assert.ok(
+    inflight().length <= 3,
+    "grants stay bounded while the poll is held",
+  );
+  env.close();
+  await flush();
+});
+
+test("each held long poll tightens the h1.1 parts cap", async () => {
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 8 });
+  for (const cursor of ["0", "7"]) {
+    const poll = requestClient.send(
+      "/api/v1/down",
+      requestClient.options(
+        "POST",
+        SESSION,
+        null,
+        { "X-Down-Cursor": cursor },
+        null,
+      ),
+      null,
+      1,
+      null,
+    );
+    poll.catch(() => {});
+  }
+  await flush();
+  assert.equal(env.pending("/api/v1/down").length, 2);
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(23)),
+    frame(2, 1, new Array(48 * 1024).fill(24)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    null,
+    null,
+  );
+  operation.catch(() => {});
+  await flush();
+  assert.equal(
+    ups(env).filter((r) => !r.answered).length,
+    2,
+    "cap is 6 - 2 long polls - 2 reserve",
+  );
+  env.close();
+  await flush();
+});
+
+test("single-part and final uplink parts bypass the parts pool", async () => {
+  // Unknown protocol keeps the conservative h1.1 envelope: cap = 6 - 0 - 2.
+  const env = environment(renderedPage());
+  const requestClient = client(env, { parallelParts: () => 6 });
+  const bulk = (marker) =>
+    join(
+      frame(2, 1, new Array(48 * 1024).fill(marker)),
+      frame(2, 1, new Array(48 * 1024).fill(marker + 1)),
+    );
+  const uplink = (sequence, body) => {
+    const operation = requestClient.send(
+      "/api/v1/up",
+      requestClient.options(
+        "POST",
+        SESSION,
+        body,
+        { "X-Up-Seq": String(sequence) },
+        null,
+      ),
+      null,
+      null,
+      null,
+    );
+    operation.catch(() => {});
+    return operation;
+  };
+  const opA = uplink(7, bulk(41));
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(inflight().length, 4, "four parts hold the h1.1 cap");
+  // A single-part operation never queues behind bulk fragments.
+  const ping = uplink(9, frame(5, 1, [9]));
+  await flush();
+  const single = inflight().find((r) => params(r.url).get("s") === "9");
+  assert.ok(single, "single-part op dispatched over a saturated pool");
+  assert.equal(params(single.url).get("pn"), null);
+  env.answer(single, 204, null, { "X-Up-Ack": "9", "X-Up-Part": "0" });
+  await flush();
+  const pingResponse = await ping;
+  assert.equal(pingResponse.status, 204);
+  // Drain op A down to its last non-final part, then let op B's workers flood
+  // the pool: the closing part must still dispatch without waiting for a slot.
+  const seqA = (r) => params(r.url).get("s") === "7";
+  const total = Number(params(inflight().find(seqA).url).get("pn"));
+  const lastIndex = String(total - 1);
+  const nonFinalA = (r) => seqA(r) && params(r.url).get("p") !== lastIndex;
+  let acked = 0;
+  for (let step = 0; step < 4096 && acked < total - 2; step++) {
+    const pending = inflight().filter(nonFinalA);
+    if (pending.length) {
+      env.answer(pending[0], 204, null, {
+        "X-Up-Part": params(pending[0].url).get("p"),
+      });
+      acked++;
+    }
+    await flush();
+  }
+  await flush();
+  const lastNonFinal = inflight().find(nonFinalA);
+  assert.ok(lastNonFinal, "exactly one non-final part is outstanding");
+  uplink(8, bulk(43));
+  await flush();
+  env.answer(lastNonFinal, 204, null, {
+    "X-Up-Part": params(lastNonFinal.url).get("p"),
+  });
+  await flush();
+  const final = inflight().find(
+    (r) => seqA(r) && params(r.url).get("p") === lastIndex,
+  );
+  assert.ok(final, "final part dispatched while the pool stays saturated");
+  assert.equal(inflight().length, 5, "final bypasses the four held slots");
+  env.answer(final, 204, null, { "X-Up-Ack": "7", "X-Up-Part": lastIndex });
+  const response = await opA;
+  assert.equal(response.status, 204);
+  env.close();
+  await flush();
+});
+
+test("a multiplexed edge lifts the scheduler cap to K", async () => {
+  const env = environment(renderedPage());
+  env.setProtocol("h2");
+  const requestClient = client(env, { parallelParts: () => 6 });
+  const body = join(
+    frame(2, 1, new Array(48 * 1024).fill(31)),
+    frame(2, 1, new Array(48 * 1024).fill(32)),
+  );
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    null,
+    null,
+  );
+  operation.catch(() => {});
+  await flush();
+  const inflight = () => ups(env).filter((r) => !r.answered);
+  assert.equal(inflight().length, 6, "h2 admits the full K worker pool");
   env.close();
   await flush();
 });
