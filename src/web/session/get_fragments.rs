@@ -26,6 +26,9 @@ struct GetAssembly {
     commitment: usize,
     /// Global body-byte lease covering exactly the accepted bytes and slots.
     budget: GetBodyLease,
+    /// Copy space for the final assembly, reserved when the record opens so
+    /// an operation whose parts were all accepted can always complete.
+    staging: Option<GetBodyLease>,
 }
 
 /// Retained complete body used for exact fragment replays without reapplication.

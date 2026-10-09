@@ -165,7 +165,7 @@ impl WebSession {
                 }
                 // With every earlier part stored the final part can no longer
                 // grow the set, so the copy reservation size is stable here.
-                let stage = if part == total - 1 {
+                let stage = if part == total - 1 && assembly.staging.is_none() {
                     assembly.bytes_received
                 } else {
                     0
@@ -354,6 +354,26 @@ impl WebSession {
                 state = self.state.lock();
                 continue;
             }
+            // A multi-part operation also reserves the copy space its final
+            // part needs (every earlier part is one chunk long), so the final
+            // never meets a full GET share after its parts were accepted.
+            let reserve = if total > 1 {
+                max_body.min((total as usize - 1).saturating_mul(data.len()))
+            } else {
+                0
+            };
+            if reserve > 0 && staging.as_ref().is_none_or(|(size, _)| *size != reserve) {
+                if let Some((_, permit)) = staging.take() {
+                    spare.push(permit);
+                }
+                drop(state);
+                let Some(permit) = manager.try_body_bytes(reserve) else {
+                    return Err(GetUpReject::Busy);
+                };
+                staging = Some((reserve, permit));
+                state = self.state.lock();
+                continue;
+            }
             let Some((_, permit)) = lease.take() else {
                 return Err(GetUpReject::Busy);
             };
@@ -411,6 +431,7 @@ impl WebSession {
                     last_part_at: now,
                     commitment,
                     budget: permit,
+                    staging: staging.take().map(|(_, permit)| permit),
                 },
             );
             self.touch_peer_locked(
@@ -436,8 +457,11 @@ impl WebSession {
             bytes_received,
             parts,
             budget,
+            staging: reserved,
             ..
         } = assembly;
+        // The reserved copy space releases after the session lock drops.
+        spare.extend(reserved);
         let mut part_meta = Vec::with_capacity(parts.len());
         let mut body = Vec::with_capacity(bytes_received);
         for chunk in parts.into_iter().flatten() {

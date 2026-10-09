@@ -134,7 +134,9 @@ async fn accounting_is_incremental_and_head_ops_keep_window_budget() {
     let total = GET_MAX_PARTS;
     let commitment =
         max_body.min(total as usize * part.len()) + total as usize * GET_PART_META_BYTES;
-    let open_lease = total as usize * GET_PART_META_BYTES + part.len();
+    // Opening also reserves the final assembly's copy space up front.
+    let reserve = max_body.min((total as usize - 1) * part.len());
+    let open_lease = total as usize * GET_PART_META_BYTES + part.len() + reserve;
 
     // Three non-head openings saturate the (W-1)*C commitment share.
     for sequence in 2..=4u64 {
@@ -465,6 +467,55 @@ async fn confirmation_retires_an_open_replay_record() {
     assert_eq!(
         committed_bytes(&session),
         4 * (64 + 2 * GET_PART_META_BYTES)
+    );
+
+    manager.shutdown().await;
+}
+
+/// A full GET share never strands an operation whose parts were accepted:
+/// its final part completes instead of answering 503 into a recovery.
+#[tokio::test]
+async fn final_part_completes_while_other_sessions_fill_the_share() {
+    let mut config = ProxyConfig::default();
+    config.web.limits.max_body_bytes = 64 * 1024;
+    config.web.limits.max_body_bytes_global = 1024 * 1024;
+    let limits = config.web.limits.clone();
+    let generation = test_runtime_generation(1, config);
+    let manager = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation)));
+    let part = Bytes::from(vec![9u8; 4096]);
+
+    // Session 1 stores every non-final part of one operation.
+    let first = session_in(&manager, limits.clone(), false, 1);
+    first.configure_conveyor(4);
+    for index in 0..15u32 {
+        assert!(matches!(
+            first.offer_get_up(None, 1, Some(0), index, 16, part.clone()),
+            Ok(GetUpOffer::Pending(_))
+        ));
+    }
+    // Other sessions then fill the GET share until it answers busy.
+    let mut busy = 0usize;
+    let mut others = Vec::new();
+    for id in 2..=6u8 {
+        let session = session_in(&manager, limits.clone(), false, id);
+        session.configure_conveyor(4);
+        for sequence in 1..=4u64 {
+            for index in 0..15u32 {
+                if let Err(GetUpReject::Busy) =
+                    session.offer_get_up(None, sequence, Some(0), index, 16, part.clone())
+                {
+                    busy += 1;
+                }
+            }
+        }
+        others.push(session);
+    }
+    assert!(busy > 0, "the share is exhausted");
+    // The first session's final part still assembles its operation.
+    let last = first.offer_get_up(None, 1, Some(0), 15, 16, Bytes::from(vec![9u8; 100]));
+    assert!(
+        matches!(last, Ok(GetUpOffer::Complete { .. })),
+        "the final part is never busy"
     );
 
     manager.shutdown().await;
