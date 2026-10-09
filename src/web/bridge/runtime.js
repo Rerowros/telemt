@@ -9,6 +9,8 @@ const bufferSupport=globalThis.TelemtBridgeBuffers;if(!bufferSupport)throw new E
 const recoverySupport=globalThis.TelemtBridgeRecovery;if(!recoverySupport)throw new Error('missing recovery runtime');
 // Keep the method page-owned so recovery and config rollback cannot change frozen retries.
 const carrierMethod='__CARRIER_METHOD__';
+// The configured URL envelope is page-owned like the carrier method.
+const getUrlBytes=__GET_URL_BYTES__;
 let negotiationEnabled=__NEGOTIATION_ENABLED__,candidateCount=__CANDIDATE_COUNT__,candidateDeadlines=[__CARRIER_DEADLINES__];
 let longPollMs=__LONG_POLL_SECS__*1000,bridgeRequestMs=__BRIDGE_REQUEST_SECS__*1000,bridgeRetryMs=__BRIDGE_RETRY_SECS__*1000;
 let bridgeRecoveryMs=__BRIDGE_RECOVERY_SECS__*1000,websocketOpenMs=__WEBSOCKET_OPEN_SECS__*1000,reconnectGraceMs=__RECONNECT_GRACE_SECS__*1000;
@@ -32,6 +34,7 @@ const socketURL=()=>relayBase.replace(/^https:/,'wss:')+'/api/v1/ws';
 const requestClient=requestSupport.create({
  base:()=>relayBase,closed:()=>closed,retryMs:()=>bridgeRetryMs,longPollMs:()=>longPollMs,requestMs:()=>bridgeRequestMs,
  batchLimit:()=>batchLimit,read:(response,limit,exact,signal)=>responseBody.read(response,limit,exact,signal),cancel:responseBody.cancel,
+ method:()=>carrierMethod,getUrlBytes:()=>getUrlBytes,
  failure,reason:failureReason,retrying:()=>status('reconnecting')
 });
 const options=requestClient.options,pause=requestClient.pause,request=requestClient.send;
@@ -380,7 +383,11 @@ async function runLaneSocketUp(lane){
 }
 function deleteSession(){
  const token=cleanupToken||sessionToken,headers=canonicalFailures.includes(terminalFailure)?{'X-Carrier-Failure':terminalFailure}:null;
- if(token)fetch(relayBase+'/api/v1/session',options('DELETE',token,null,headers,undefined,true)).catch(()=>{});
+ if(!token)return;
+ if('GET'===carrierMethod){
+  const frozen=options('GET',token,null,headers,undefined,true);
+  fetch(requestClient.url('/api/v1/session',frozen,true),frozen).catch(()=>{});
+ }else fetch(relayBase+'/api/v1/session',options('DELETE',token,null,headers,undefined,true)).catch(()=>{});
 }
 function close(notifyServer){
  if(closed)return;closed=true;stopHttp(false);if(recoveryController)recoveryController.cancel();rejectRecoveryCommit(failure('network','bridge closed'));if(helloTimer)clearTimeout(helloTimer);helloTimer=null;if(carrierTimer)clearTimeout(carrierTimer);clearProbeTimer();if(schedulerTimer)clearTimeout(schedulerTimer);schedulerTimer=null;if(attemptController)attemptController.abort();
@@ -408,7 +415,7 @@ function activatePort(nextPort){
  port.start();status('connecting');helloTimer=setTimeout(__HELLO_TIMEOUT_CALLBACK__,bridgeRequestMs);
 }
 recoveryController=recoverySupport.create({
- budgetMs:()=>bridgeRecoveryMs,requestMs:()=>bridgeRequestMs,url:()=>relayOrigin+recoveryPath,token:()=>cleanupToken||sessionToken,
+ budgetMs:()=>bridgeRecoveryMs,requestMs:()=>bridgeRequestMs,url:()=>relayOrigin+recoveryPath,nonce:()=>'GET'===carrierMethod?requestSupport.get.nonce():'',token:()=>cleanupToken||sessionToken,
  read:(response,limit,exact,signal)=>responseBody.read(response,limit,exact,signal),cancel:responseBody.cancel,status:()=>status('reconnecting'),
  restored:finishOldRecovery,replace:replaceCarrier,replaceable:error=>failureReason(error,'network')!=='protocol',
  reason:(error,fallback)=>failureReason(error,fallback),terminal:reason=>fail(recoveryController.remaining()<=0?'timeout':reason)

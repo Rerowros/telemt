@@ -11,7 +11,7 @@ function renderedPage(){
  page=page.replace('__DIAGNOSTIC_RUNTIME__','');
  for(const [key,file] of Object.entries(modules))if(page.includes('__'+key+'_RUNTIME__'))page=page.replace('__'+key+'_RUNTIME__',()=>fs.readFileSync(path.join(__dirname,file+'.js'),'utf8'));
  page=page.replace('__RUNTIME__',()=>fs.readFileSync(path.join(__dirname,'runtime.js'),'utf8'));
- const values={BOOTSTRAP:'A'.repeat(43),HOST:'proxy.example.com',BASE_PREFIX:'',CARRIER_METHOD:'POST',NEGOTIATION_ENABLED:'true',CANDIDATE_COUNT:4,CARRIER_DEADLINES:'3,5,8,12',LONG_POLL_SECS:25,BRIDGE_REQUEST_SECS:10,BRIDGE_RETRY_SECS:90,BRIDGE_RECOVERY_SECS:15,WEBSOCKET_OPEN_SECS:15,RECONNECT_GRACE_SECS:120,CARRIER_PROBE_COALESCE_MS:0,BATCH_LIMIT:2097152,QUEUE_LIMIT:33554432,QUEUE_ITEMS:16384,MAX_STREAMS:1024,STATUS_FUNCTION:"state=>{if(port&&!closed)port.postMessage({t:'status',state})}",HELLO_TIMEOUT_CALLBACK:"()=>fail('timeout')",PAGEHIDE_CALLBACK:'()=>close(true)'};
+ const values={BOOTSTRAP:'A'.repeat(43),HOST:'proxy.example.com',BASE_PREFIX:'',CARRIER_METHOD:'POST',NEGOTIATION_ENABLED:'true',CANDIDATE_COUNT:4,CARRIER_DEADLINES:'3,5,8,12',LONG_POLL_SECS:25,BRIDGE_REQUEST_SECS:10,BRIDGE_RETRY_SECS:90,BRIDGE_RECOVERY_SECS:15,WEBSOCKET_OPEN_SECS:15,RECONNECT_GRACE_SECS:120,CARRIER_PROBE_COALESCE_MS:0,GET_URL_BYTES:7168,BATCH_LIMIT:2097152,QUEUE_LIMIT:33554432,QUEUE_ITEMS:16384,MAX_STREAMS:1024,STATUS_FUNCTION:"state=>{if(port&&!closed)port.postMessage({t:'status',state})}",HELLO_TIMEOUT_CALLBACK:"()=>fail('timeout')",PAGEHIDE_CALLBACK:'()=>close(true)'};
  return page.replace(/__([A-Z_]+)__/g,(all,key)=>key.startsWith('DIAGNOSTIC_')?'':String(values[key]??''));
 }
 function frame(type,id=0,payload=[]){
@@ -23,7 +23,7 @@ async function flush(){for(let i=0;i<40;i++)await Promise.resolve()}
 function environment(page,android=false){
  let now=1000,nextTimer=1;const timers=new Map(),events=new Map(),requests=[],received=[];
  const port={onmessage:null,start(){},close(){},postMessage(value,transfer){received.push(structuredClone(value,{transfer:transfer||[]}))}};
- const context={ArrayBuffer,Uint8Array,DataView,TextDecoder,TextEncoder,URL,Headers,AbortController,ReadableStream,structuredClone,console,
+ const context={ArrayBuffer,Uint8Array,DataView,TextDecoder,TextEncoder,URL,URLSearchParams,Headers,AbortController,ReadableStream,structuredClone,console,
   location:{hash:android?'#android='+'A'.repeat(43):'',pathname:'/',search:'?bridge=test'},history:{replaceState(){}},parent:{},
   performance:{now:()=>now},Date:class extends Date{static now(){return now}},document:{visibilityState:'visible',addEventListener(){}},
   addEventListener:(name,fn)=>events.set(name,fn),setTimeout:(fn,delay)=>{const id=nextTimer++;timers.set(id,{fn,at:now+delay});return id},clearTimeout:id=>timers.delete(id),

@@ -1,9 +1,9 @@
 use super::*;
-use crate::web::session::ConveyorError;
+use crate::web::session::{ConveyorError, GetUpOffer, GetUpReject};
 
 /// Handles one bounded legacy or explicitly negotiated conveyor uplink.
 pub(super) async fn handle_up(
-    request: Request<RequestBody>,
+    mut request: Request<RequestBody>,
     runtime: Arc<WebProcessRuntime>,
     vhost: Arc<WebRuntimeVhost>,
     token_hash: crate::web::manager::TokenHash,
@@ -37,6 +37,21 @@ pub(super) async fn handle_up(
     } else {
         None
     };
+    if let Some(parts) = request.extensions_mut().remove::<get::GetUpParts>() {
+        return handle_get_up(
+            request,
+            runtime,
+            vhost,
+            session,
+            get::GetUpOperation {
+                lane_id,
+                sequence,
+                confirmed,
+            },
+            parts,
+        )
+        .await;
+    }
     let claim = match session.claim_conveyor(lane_id, sequence, confirmed) {
         Ok(claim) => claim,
         Err(ConveyorError::Stale | ConveyorError::Mode) => {
@@ -98,6 +113,90 @@ pub(super) async fn handle_up(
                 HeaderName::from_static("x-up-ack"),
                 &ack.to_string(),
             );
+            response
+        }
+        Err(ConveyorError::Stale | ConveyorError::Mode) => carrier_empty(StatusCode::CONFLICT),
+        Err(ConveyorError::Manager(
+            ManagerError::Backpressure | ManagerError::Concurrent | ManagerError::Limit,
+        )) => service_unavailable(),
+        Err(_) => serve_decoy(request, vhost, true, &runtime).await,
+    }
+}
+
+/// Handles one strict GET uplink fragment: intermediate parts only enter
+/// per-session reassembly while the final part drives the canonical claim
+/// and frame application exactly like one POST body.
+async fn handle_get_up(
+    request: Request<RequestBody>,
+    runtime: Arc<WebProcessRuntime>,
+    vhost: Arc<WebRuntimeVhost>,
+    session: Arc<crate::web::session::WebSession>,
+    operation: get::GetUpOperation,
+    parts: get::GetUpParts,
+) -> HttpResponse {
+    let part = parts.part;
+    let (body, _budget) = match session.offer_get_up(
+        operation.lane_id,
+        operation.sequence,
+        operation.confirmed,
+        parts.part,
+        parts.total,
+        parts.data,
+    ) {
+        Ok(GetUpOffer::Pending(part)) => {
+            let mut response = carrier_empty(StatusCode::NO_CONTENT);
+            insert_header(&mut response, get::up_part_header_name(), &part.to_string());
+            return response;
+        }
+        Ok(GetUpOffer::Complete { body, budget }) => (body, budget),
+        Err(GetUpReject::Busy) => return service_unavailable(),
+        Err(GetUpReject::Decoy) => {
+            return serve_decoy(request, vhost, true, &runtime).await;
+        }
+    };
+    if let Some(trace) = request_trace(&request) {
+        trace.record_frames(TraceDirection::Request, &body, session.limits());
+    }
+    let claim =
+        match session.claim_conveyor(operation.lane_id, operation.sequence, operation.confirmed) {
+            Ok(claim) => claim,
+            Err(ConveyorError::Stale | ConveyorError::Mode) => {
+                return carrier_empty(StatusCode::CONFLICT);
+            }
+            Err(ConveyorError::Manager(
+                ManagerError::Backpressure | ManagerError::Concurrent | ManagerError::Limit,
+            )) => {
+                return service_unavailable();
+            }
+            Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
+        };
+    let result = if let Some(claim) = claim {
+        let _deadline_lease = match super::request_deadline(&request) {
+            Some(deadline) => {
+                match deadline.lease_for(Duration::from_secs(session.timeouts().body_secs)) {
+                    Some(lease) => Some(lease),
+                    None => return service_unavailable(),
+                }
+            }
+            None => None,
+        };
+        claim.process(&body).await
+    } else {
+        match operation.lane_id {
+            Some(lane_id) => session.process_up_lane(lane_id, operation.sequence, &body),
+            None => session.process_up(operation.sequence, &body),
+        }
+        .map_err(ConveyorError::Manager)
+    };
+    match result {
+        Ok(ack) => {
+            let mut response = carrier_empty(StatusCode::NO_CONTENT);
+            insert_header(
+                &mut response,
+                HeaderName::from_static("x-up-ack"),
+                &ack.to_string(),
+            );
+            insert_header(&mut response, get::up_part_header_name(), &part.to_string());
             response
         }
         Err(ConveyorError::Stale | ConveyorError::Mode) => carrier_empty(StatusCode::CONFLICT),

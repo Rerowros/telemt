@@ -57,6 +57,9 @@ mod uplink;
 // HTTP conveyor ownership bounds reordered requests without changing native frames.
 mod conveyor;
 pub(crate) use conveyor::{ConveyorError, conveyor_waiter_limit};
+pub(crate) use get_fragments::{GetUpOffer, GetUpReject};
+// Bounded GET uplink fragment reassembly with shared body leases.
+mod get_fragments;
 // Logical stream polling owns cancellation-safe waker registration.
 mod stream_io;
 
@@ -164,6 +167,8 @@ impl CarrierLane {
 
 struct SessionState {
     conveyor: conveyor::ConveyorState,
+    carrier_method: crate::config::WebCarrierMethod,
+    get_fragments: get_fragments::GetFragments,
     streams: HashMap<u32, StreamState>,
     closing_streams: HashMap<u32, u64>,
     next_stream_instance: u64,
@@ -300,6 +305,8 @@ impl WebSession {
             _user_registration: user_registration,
             state: Mutex::new(SessionState {
                 conveyor: conveyor::ConveyorState::default(),
+                carrier_method: crate::config::WebCarrierMethod::default(),
+                get_fragments: get_fragments::GetFragments::default(),
                 streams: HashMap::new(),
                 closing_streams: HashMap::new(),
                 next_stream_instance: 1,

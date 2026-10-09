@@ -5,7 +5,7 @@ use std::time::Duration;
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode};
 
-use super::body::{CollectBodyError, CollectedBody, RequestBody, collect_body};
+use super::body::{CollectBodyError, CollectedBody, RequestBody, collect_body, collected_from_get};
 use super::decoy::serve_decoy;
 use super::request::{
     binary_content_type, carrier_ip_learning_eligible, carrier_request, optional_failure_header,
@@ -23,7 +23,7 @@ const CREATE_BODY_LIMIT: usize = 64;
 
 /// Handles session creation, replacement replay, and authenticated closure.
 pub(super) async fn handle_session(
-    request: Request<RequestBody>,
+    mut request: Request<RequestBody>,
     runtime: Arc<WebProcessRuntime>,
     vhost: Arc<WebRuntimeVhost>,
     token_hash: TokenHash,
@@ -97,11 +97,20 @@ pub(super) async fn handle_session(
         trace.set_route(TraceRoute::Session);
         trace.bind_profile(&profile, trace_session_id);
     }
+    let collected = match request
+        .extensions_mut()
+        .remove::<super::get::GetRequestBody>()
+    {
+        Some(super::get::GetRequestBody::Raw(body)) => {
+            collected_from_get(request, body, &runtime).ok_or(CollectBodyError::Limit)
+        }
+        None => collect_body(request, &runtime, body_timeout, CREATE_BODY_LIMIT, false).await,
+    };
     let CollectedBody {
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, body_timeout, CREATE_BODY_LIMIT, false).await {
+    } = match collected {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {

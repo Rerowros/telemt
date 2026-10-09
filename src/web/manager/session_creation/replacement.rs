@@ -105,6 +105,7 @@ impl WebProcessRuntime {
             Some(user_registration),
         );
         session.configure_conveyor(replacement.old_session.conveyor_offer());
+        session.configure_carrier_method(replacement.old_session.carrier_method());
         let Some(supersede) = replacement.old_session.prepare_carrier_supersede() else {
             drop(user_publication);
             drop(state);
@@ -119,6 +120,7 @@ impl WebProcessRuntime {
             old_hash,
             &replacement.profile.host,
             replacement.old_session.carrier(),
+            replacement.old_session.carrier_method(),
             Duration::from_secs(replacement.old_session.timeouts().bootstrap_lifetime_secs),
             self.limits.max_sessions_global.saturating_mul(16),
         );

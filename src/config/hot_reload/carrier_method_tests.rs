@@ -48,3 +48,40 @@ fn carrier_method_reload_publishes_both_directions_and_keeps_last_good_value() {
         assert!(Arc::ptr_eq(&unchanged, &applied));
     }
 }
+
+#[test]
+fn carrier_method_get_reload_roundtrips_and_rejects_websocket_combos() {
+    // A plain GET toggle is hot; a GET + WebSocket candidate combination
+    // fails validation and keeps the last good configuration.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[web]\ncarrier_method = \"post\"\n").unwrap();
+    let initial = Arc::new(ProxyConfig::load(&path).unwrap());
+    let initial_hash = ProxyConfig::load_with_metadata(&path)
+        .unwrap()
+        .rendered_hash;
+    let (config_tx, _config_rx) = watch::channel(Arc::clone(&initial));
+    let (log_tx, _log_rx) = watch::channel(initial.general.log_level.clone());
+    let mut reload_state = ReloadState::new(Some(initial_hash));
+
+    std::fs::write(&path, "[web]\ncarrier_method = \"get\"\n").unwrap();
+    reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+    let applied = config_tx.borrow().clone();
+    assert_eq!(applied.web.carrier_method, WebCarrierMethod::Get);
+
+    // Rolling back to POST must stay hot as well.
+    std::fs::write(&path, "[web]\ncarrier_method = \"post\"\n").unwrap();
+    reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+    let applied = config_tx.borrow().clone();
+    assert_eq!(applied.web.carrier_method, WebCarrierMethod::Post);
+
+    // GET with a WebSocket carrier is invalid; the last good value survives.
+    std::fs::write(
+        &path,
+        "[web]\ncarrier = \"websocket\"\ncarrier_method = \"get\"\n",
+    )
+    .unwrap();
+    reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state);
+    let unchanged = config_tx.borrow().clone();
+    assert!(Arc::ptr_eq(&unchanged, &applied));
+}

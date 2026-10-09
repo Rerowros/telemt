@@ -112,6 +112,23 @@ impl ConveyorState {
             .map(|(_, channel)| channel.notify)
             .collect()
     }
+
+    /// Returns client-confirmed and applied sequences bounding GET fragment admission.
+    pub(super) fn sequence_floor(&self, lane: Option<u32>) -> (u64, u64) {
+        self.channels
+            .get(&lane)
+            .map_or((0, 0), |channel| (channel.confirmed, channel.committed))
+    }
+
+    /// Returns the negotiated window used to bound fragment records per lane.
+    pub(super) fn offer_window(&self) -> usize {
+        usize::from(self.offered.max(1))
+    }
+
+    /// Returns the frozen ordering mode once a canonical claim sets it.
+    pub(super) fn frozen_mode(&self) -> Option<bool> {
+        self.mode
+    }
 }
 
 /// An exact request owner; its body and ordinary body permit stay in the HTTP handler.
@@ -140,6 +157,16 @@ impl WebSession {
     /// Returns the immutable chain ceiling even across a WebSocket candidate.
     pub(crate) fn conveyor_offer(&self) -> u8 {
         self.state.lock().conveyor.offered
+    }
+
+    /// Freezes the HTTPS carrier method chosen by the issuing bootstrap.
+    pub(crate) fn configure_carrier_method(&self, method: crate::config::WebCarrierMethod) {
+        self.state.lock().carrier_method = method;
+    }
+
+    /// Returns the carrier method frozen at session creation.
+    pub(crate) fn carrier_method(&self) -> crate::config::WebCarrierMethod {
+        self.state.lock().carrier_method
     }
 
     /// Returns the HTTP window without changing carrier capability negotiation.

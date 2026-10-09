@@ -36,6 +36,8 @@ mod decoy;
 mod diagnostic;
 // Downlink long-poll handling remains isolated from request routing.
 mod down;
+// Strict GET query normalization rewrites carrier requests before canonical handling.
+mod get;
 // Uplink admission and conveyor waits own their bounded request bodies.
 mod up;
 // Canonical request parsing rejects ambiguous credentials before routing.
@@ -247,7 +249,13 @@ async fn handle_root(
         strip_query(&mut request);
         return serve_decoy(request, vhost, true, &runtime).await;
     }
-    let candidate = bridge_candidate(request.uri().query());
+    // Authenticated recovery media may carry one unique GET nonce; the
+    // ordinary bridge document keeps the exact single-key query grammar.
+    let candidate = if matches!(representation, recovery::RootRepresentation::Recovery(_)) {
+        capability::bridge_candidate_recovery(request.uri().query())
+    } else {
+        bridge_candidate(request.uri().query())
+    };
     let canonical = candidate.is_canonical();
     let plausible_candidate = canonical && request.method() == Method::GET;
     let fasttrack_mode = vhost.decoy_fasttrack_mode;
@@ -373,7 +381,7 @@ async fn handle_root(
         };
         return response;
     }
-    let page = bridge::render(
+    let page = bridge::render_with_get_url(
         &vhost.host,
         &vhost.base,
         &bootstrap.token,
@@ -392,7 +400,8 @@ async fn handle_root(
         config.web.timeouts.reconnect_grace_secs,
         config.web.timeouts.carrier_probe_coalesce_ms,
         config.web.debug.bridge_diagnostics_enabled(),
-        config.web.carrier_method,
+        config.web.effective_carrier_method(&vhost.host),
+        config.web.limits.get_url_bytes,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));
@@ -429,13 +438,17 @@ async fn handle_root(
 }
 
 async fn handle_api(
-    request: Request<RequestBody>,
+    mut request: Request<RequestBody>,
     peer: SocketAddr,
     client_ip_source: WebClientIpSource,
     trusted_proxy_cidrs: &[IpNetwork],
     runtime: Arc<WebProcessRuntime>,
     vhost: Arc<WebRuntimeVhost>,
 ) -> HttpResponse {
+    if request.method() == Method::GET && get::normalize(&mut request, &runtime, &vhost).is_err() {
+        strip_query(&mut request);
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     if request.uri().query().is_some() || !compatible_cookie_header(&request) {
         return serve_decoy(request, vhost, true, &runtime).await;
     }

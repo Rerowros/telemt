@@ -15,6 +15,9 @@ pub(crate) struct BridgePage {
 }
 
 /// Renders the bounded WEB carrier-negotiation bridge with a fresh CSP nonce.
+/// Tests exercise the default GET URL budget; production renders via
+/// [`render_with_get_url`] with the configured limit.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     host: &str,
@@ -36,6 +39,56 @@ pub(crate) fn render(
     carrier_probe_coalesce_ms: u64,
     bridge_diagnostics_enabled: bool,
     carrier_method: WebCarrierMethod,
+    rng: &SecureRandom,
+) -> BridgePage {
+    render_with_get_url(
+        host,
+        base,
+        bootstrap,
+        batch_limit,
+        queue_limit,
+        queue_items,
+        max_streams,
+        negotiation_enabled,
+        candidate_count,
+        carrier_deadlines,
+        long_poll_secs,
+        bridge_request_secs,
+        bridge_retry_secs,
+        bridge_recovery_secs,
+        websocket_open_secs,
+        reconnect_grace_secs,
+        carrier_probe_coalesce_ms,
+        bridge_diagnostics_enabled,
+        carrier_method,
+        crate::config::WebLimitsConfig::default().get_url_bytes,
+        rng,
+    )
+}
+
+/// Renders the bridge with the effective GET URL budget owned by the page.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_with_get_url(
+    host: &str,
+    base: &str,
+    bootstrap: &str,
+    batch_limit: usize,
+    queue_limit: usize,
+    queue_items: usize,
+    max_streams: usize,
+    negotiation_enabled: bool,
+    candidate_count: usize,
+    carrier_deadlines: [u64; 4],
+    long_poll_secs: u64,
+    bridge_request_secs: u64,
+    bridge_retry_secs: u64,
+    bridge_recovery_secs: u64,
+    websocket_open_secs: u64,
+    reconnect_grace_secs: u64,
+    carrier_probe_coalesce_ms: u64,
+    bridge_diagnostics_enabled: bool,
+    carrier_method: WebCarrierMethod,
+    get_url_bytes: usize,
     rng: &SecureRandom,
 ) -> BridgePage {
     let mut nonce = [0u8; 18];
@@ -129,6 +182,7 @@ pub(crate) fn render(
         .replace("__BASE_PREFIX__", base_prefix)
         .replace("__BOOTSTRAP__", bootstrap)
         .replace("__CARRIER_METHOD__", carrier_method.as_str())
+        .replace("__GET_URL_BYTES__", &get_url_bytes.to_string())
         .replace("__BATCH_LIMIT__", &batch_limit.to_string())
         .replace("__QUEUE_LIMIT__", &queue_limit.to_string())
         .replace("__QUEUE_ITEMS__", &queue_items.to_string())

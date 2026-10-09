@@ -244,6 +244,13 @@ impl WebSession {
         if let Some(claim) = healthy {
             self.finish_carrier_health(claim);
         }
+        let expired_fragments = {
+            let mut state = self.state.lock();
+            state
+                .get_fragments
+                .expire(now, Duration::from_secs(self.timeouts.bridge_request_secs))
+        };
+        drop(expired_fragments);
         let Some(released) = self.begin_idle_close(now) else {
             return false;
         };
@@ -282,6 +289,8 @@ impl WebSession {
         for notify in state.conveyor.clear() {
             effects.notify(notify);
         }
+        let get_fragments = std::mem::take(&mut state.get_fragments);
+        effects.retain_get_fragments(get_fragments);
         if reason == SessionCloseReason::CarrierSuperseded {
             state.negotiation_phase = SessionNegotiationPhase::Superseded;
         }

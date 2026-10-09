@@ -81,6 +81,7 @@ impl WebProcessRuntime {
             hash,
             profile_host,
             session.carrier(),
+            session.carrier_method(),
             closed_token_lifetime,
             self.limits.max_sessions_global.saturating_mul(16),
         );

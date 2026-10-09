@@ -279,6 +279,7 @@ const WEB_CONFIG_KEYS: &[&str] = &[
 const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "max_header_bytes",
     "max_body_bytes",
+    "get_url_bytes",
     "max_frame_payload_bytes",
     "carrier_batch_bytes",
     "max_frames_per_body",
@@ -368,7 +369,14 @@ const WEB_TIMEOUTS_CONFIG_KEYS: &[&str] = &[
     "decoy_resolve_secs",
 ];
 
-const WEB_VHOST_CONFIG_KEYS: &[&str] = &["host", "base_path", "public_addr", "decoy", "profiles"];
+const WEB_VHOST_CONFIG_KEYS: &[&str] = &[
+    "host",
+    "base_path",
+    "carrier_method",
+    "public_addr",
+    "decoy",
+    "profiles",
+];
 const WEB_DECOY_CONFIG_KEYS: &[&str] = &["mode", "upstream", "directory", "index", "resolve"];
 const WEB_PROFILE_CONFIG_KEYS: &[&str] = &[
     "user",

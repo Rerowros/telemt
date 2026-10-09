@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hyper::header;
 use hyper::{Method, Request, StatusCode};
 
-use super::body::{CollectBodyError, CollectedBody, RequestBody, collect_body};
+use super::body::{CollectBodyError, CollectedBody, RequestBody, collect_body, collected_from_get};
 use super::decoy::serve_decoy;
 use super::response::{carrier_empty, service_unavailable};
 use super::{HttpResponse, request_trace};
@@ -16,7 +16,7 @@ const DIAGNOSTIC_BODY_LIMIT: usize = 64;
 
 /// Handles one bounded generated-bridge diagnostic report.
 pub(super) async fn handle(
-    request: Request<RequestBody>,
+    mut request: Request<RequestBody>,
     runtime: Arc<WebProcessRuntime>,
     vhost: Arc<WebRuntimeVhost>,
     token_hash: TokenHash,
@@ -34,19 +34,29 @@ pub(super) async fn handle(
         trace.set_route(TraceRoute::Diagnostic);
         trace.bind_profile(&profile, trace_session_id);
     }
+    let collected = match request
+        .extensions_mut()
+        .remove::<super::get::GetRequestBody>()
+    {
+        Some(super::get::GetRequestBody::Raw(body)) => {
+            collected_from_get(request, body, &runtime).ok_or(CollectBodyError::Limit)
+        }
+        None => {
+            collect_body(
+                request,
+                &runtime,
+                body_timeout,
+                DIAGNOSTIC_BODY_LIMIT,
+                false,
+            )
+            .await
+        }
+    };
     let CollectedBody {
         request,
         body,
         _body_budget,
-    } = match collect_body(
-        request,
-        &runtime,
-        body_timeout,
-        DIAGNOSTIC_BODY_LIMIT,
-        false,
-    )
-    .await
-    {
+    } = match collected {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {

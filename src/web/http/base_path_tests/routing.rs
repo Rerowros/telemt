@@ -197,6 +197,7 @@ async fn decoy_forwarding_preserves_every_reference_request_target() {
         Arc::new(WebRuntimeVhost {
             host: previous.host.clone(),
             base: previous.base.clone(),
+            carrier_method: previous.carrier_method,
             decoy_fasttrack_mode: previous.decoy_fasttrack_mode,
             decoy: WebRuntimeDecoy::HttpUpstream {
                 addr: site_addr,

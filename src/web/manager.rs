@@ -28,6 +28,7 @@ mod negotiation;
 mod learning;
 // Bootstrap credentials and idempotent session creation are isolated from queue accounting.
 mod credentials;
+pub(crate) use credentials::GetTokenScope;
 // Authenticated bridge diagnostics remain isolated from session and carrier state.
 mod diagnostic;
 pub(crate) use diagnostic::BridgeDiagnosticEvent;
