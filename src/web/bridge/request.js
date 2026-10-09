@@ -256,14 +256,18 @@ function create(settings){
     // request cap) can fail one in-flight request without any carrier fault.
     // Idempotent uplink parts and downlink polls replay that request once at
     // once instead of escalating the whole operation to session recovery.
+    // The server answers a non-final fragment without waiting on anything,
+    // so its timeout is a stalled exchange as well and is reissued the same
+    // way; closing and single-part requests may legitimately be held.
     let delay=250,attemptCount=0,lastReason='network',reissue=uplink||downlink?1:0;
+    const pooled=uplink&&total>1&&part<total-1;
     for(;;){
      if(settings.closed()||(external&&external.aborted))throw new Error('request aborted');
      if(opSignal&&opSignal.aborted)return{kind:'stop',reason:'cancelled',lastReason};
      if(attemptCount>=attempts())return{kind:'stop',reason:'attempts',lastReason};
      const outcome=await attempt(part,opSignal);
      if(outcome.kind!=='retry'&&outcome.kind!=='budget')return outcome;
-     if(outcome.kind==='retry'&&outcome.reason==='network'&&reissue>0){reissue--;continue}
+     if(outcome.kind==='retry'&&reissue>0&&(outcome.reason==='network'||(pooled&&outcome.reason==='timeout'))){reissue--;continue}
      lastReason=outcome.reason||lastReason;
      // Retryable statuses (503 window backpressure above all) wait out the
      // operation deadline instead of spending the attempt cap; transport

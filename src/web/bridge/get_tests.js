@@ -657,6 +657,55 @@ test("a transport failure reissues a fragment or poll once before recovery", asy
   await flush();
 });
 
+test("a stalled fragment is reissued once while a held closing part escalates", async () => {
+  const env = environment(renderedPage());
+  // The operation budget outlasts both request deadlines.
+  const requestClient = client(env, {
+    parallelParts: () => 1,
+    retryMs: () => 10000,
+  });
+  // One 6 KiB frame needs exactly two fragments: part 0 and the final.
+  const body = frame(2, 1, new Array(6000).fill(73));
+  const operation = requestClient.send(
+    "/api/v1/up",
+    requestClient.options("POST", SESSION, body, { "X-Up-Seq": "7" }, null),
+    null,
+    1,
+    null,
+  );
+  let failure = null;
+  operation.catch((error) => {
+    failure = error;
+  });
+  await flush();
+  const stalled = ups(env).filter((r) => !r.answered)[0];
+  assert.equal(params(stalled.url).get("pn"), "2");
+  assert.equal(params(stalled.url).get("p"), "0");
+  // The fragment never answers; its request deadline fires.
+  await env.tick(1000);
+  assert.ok(stalled.options.signal.aborted, "the stalled fragment is aborted");
+  const reissued = ups(env).filter(
+    (r) => !r.answered && !r.options.signal.aborted,
+  )[0];
+  assert.ok(reissued, "the fragment is reissued instead of failing the op");
+  assert.equal(params(reissued.url).get("p"), "0");
+  assert.equal(failure, null);
+  env.answer(reissued, 204, null, { "X-Up-Part": "0" });
+  await flush();
+  const closing = ups(env).filter(
+    (r) => !r.answered && !r.options.signal.aborted,
+  )[0];
+  assert.equal(params(closing.url).get("p"), "1");
+  // A closing part may be held server-side behind an earlier sequence, so
+  // its timeout keeps escalating to recovery.
+  await env.tick(1000);
+  await flush();
+  assert.ok(failure, "the held closing part escalates");
+  assert.equal(failure.telemtReason, "timeout");
+  env.close();
+  await flush();
+});
+
 test("direct url construction throws before fetch when the budget is exceeded", async (page) => {
   const env = environment(page);
   const requestClient = client(env, { getUrlBytes: () => 1024 });
