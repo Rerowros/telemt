@@ -10,7 +10,7 @@ use crate::config::{
 use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::{ManagerError, WebProcessRuntime};
-use crate::web::session::{ConveyorError, WebSession};
+use crate::web::session::{ConveyorError, SessionCloseReason, WebSession};
 
 /// Minimal live session with default limits and timeouts for fragment tests.
 fn session() -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
@@ -21,6 +21,17 @@ fn session() -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
 fn session_with(automatic: bool) -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
     let generation = test_runtime_generation(1, ProxyConfig::default());
     let manager = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation)));
+    let session = session_in(&manager, WebLimitsConfig::default(), automatic, 1);
+    (session, manager)
+}
+
+/// One more session of the given manager; `id` keeps token hashes distinct.
+fn session_in(
+    manager: &Arc<WebProcessRuntime>,
+    limits: WebLimitsConfig,
+    automatic: bool,
+    id: u8,
+) -> Arc<WebSession> {
     let profile = Arc::new(WebRuntimeProfile {
         host: "proxy.example.com".to_string(),
         public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
@@ -42,9 +53,9 @@ fn session_with(automatic: bool) -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
         long_poll_secs: 1,
         ..WebTimeoutsConfig::default()
     };
-    let session = WebSession::new(
-        Arc::downgrade(&manager),
-        [1; 32],
+    WebSession::new(
+        Arc::downgrade(manager),
+        [id; 32],
         "192.0.2.10".parse().unwrap(),
         1,
         profile,
@@ -57,11 +68,10 @@ fn session_with(automatic: bool) -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
         None,
         automatic,
         false,
-        WebLimitsConfig::default(),
+        limits,
         timeouts,
         None,
-    );
-    (session, manager)
+    )
 }
 
 /// Keeps the peer fresh at the synthetic sweep instant so only fragment TTL
@@ -322,6 +332,61 @@ async fn retired_replay_during_negotiation_is_busy() {
         Err(ConveyorError::Manager(ManagerError::Backpressure))
     );
     assert!(!session.state.lock().closed);
+
+    manager.shutdown().await;
+}
+
+/// Retained GET records of many sessions stop at the GET share of the
+/// global body budget, so a POST body always finds room.
+#[tokio::test]
+async fn get_sessions_together_leave_the_post_reserve() {
+    let mut config = ProxyConfig::default();
+    config.web.limits.max_body_bytes = 64 * 1024;
+    config.web.limits.max_body_bytes_global = 1024 * 1024;
+    let limits = config.web.limits.clone();
+    let generation = test_runtime_generation(1, config);
+    let manager = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation)));
+    let global = manager.body_bytes_available();
+    assert_eq!(global, 1024 * 1024);
+
+    // Four sessions each open a full conveyor window of 64 KiB operations
+    // and park every non-final part: together they would hold ~1 MiB.
+    let part = Bytes::from(vec![9u8; 4096]);
+    let (mut stored, mut busy) = (0usize, 0usize);
+    let mut sessions = Vec::new();
+    for id in 1..=4u8 {
+        let session = session_in(&manager, limits.clone(), false, id);
+        session.configure_conveyor(4);
+        for sequence in 1..=4u64 {
+            for index in 0..15u32 {
+                match session.offer_get_up(None, sequence, Some(0), index, 16, part.clone()) {
+                    Ok(GetUpOffer::Pending(_)) => stored += 1,
+                    Err(GetUpReject::Busy) => busy += 1,
+                    _ => panic!("unexpected offer outcome"),
+                }
+            }
+        }
+        sessions.push(session);
+    }
+    assert!(stored > 0 && busy > 0, "stored={stored} busy={busy}");
+    // GET holds at most half of the global budget; the rest stays free for
+    // POST bodies of every vhost.
+    let held = global - manager.body_bytes_available();
+    assert!(held <= global / 2, "held={held}");
+    assert!(manager.body_bytes_available() >= global / 2);
+    assert!(manager.body_bytes_available() >= limits.max_body_bytes);
+    assert_eq!(
+        global / 2 - manager.get_body_bytes_available(),
+        held,
+        "both charges move together"
+    );
+
+    // Closing the sessions returns both budgets in full.
+    for session in &sessions {
+        session.close(SessionCloseReason::Protocol);
+    }
+    assert_eq!(manager.body_bytes_available(), global);
+    assert_eq!(manager.get_body_bytes_available(), global / 2);
 
     manager.shutdown().await;
 }

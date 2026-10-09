@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::web::manager::GetBodyLease;
 use bytes::Bytes;
-use tokio::sync::OwnedSemaphorePermit;
 
 /// Maximum fragment count accepted for one GET uplink operation.
 pub(super) use crate::config::GET_MAX_PARTS;
@@ -25,7 +25,7 @@ struct GetAssembly {
     /// Upper bound committed against the session budget at open time.
     commitment: usize,
     /// Global body-byte lease covering exactly the accepted bytes and slots.
-    budget: OwnedSemaphorePermit,
+    budget: GetBodyLease,
 }
 
 /// Retained complete body used for exact fragment replays without reapplication.
@@ -38,7 +38,7 @@ struct GetCompleted {
     last_part_at: Instant,
     /// Session charge released when the record retires.
     commitment: usize,
-    budget: Arc<OwnedSemaphorePermit>,
+    budget: Arc<GetBodyLease>,
 }
 
 /// Session-bounded GET uplink reassembly keyed by lane and sequence.
@@ -58,7 +58,7 @@ pub(crate) enum GetUpOffer {
     /// The logical body assembled and its shared lease transfers to canonical handling.
     Complete {
         body: Bytes,
-        budget: Arc<OwnedSemaphorePermit>,
+        budget: Arc<GetBodyLease>,
     },
 }
 

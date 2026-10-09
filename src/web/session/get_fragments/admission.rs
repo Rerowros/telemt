@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::web::manager::GetBodyLease;
 use bytes::Bytes;
-use tokio::sync::OwnedSemaphorePermit;
 
 use super::*;
 use crate::web::session::{SessionState, WebSession};
@@ -90,12 +90,12 @@ impl WebSession {
         // Declared before the guard so unused leases and retired records
         // release their permits strictly after the session lock drops.
         let mut retired = GetFragments::default();
-        let mut spare: Vec<OwnedSemaphorePermit> = Vec::new();
+        let mut spare: Vec<GetBodyLease> = Vec::new();
         // Global byte leases acquired without the session lock: `lease` charges
         // the bytes this request adds to a record, `staging` covers the final
         // part's contiguous assembly copy while the parts vector is consumed.
-        let mut lease: Option<(usize, OwnedSemaphorePermit)> = None;
-        let mut staging: Option<(usize, OwnedSemaphorePermit)> = None;
+        let mut lease: Option<(usize, GetBodyLease)> = None;
+        let mut staging: Option<(usize, GetBodyLease)> = None;
         let mut state = self.state.lock();
         loop {
             if state.closed || self.ensure_carrier_active_locked(&state).is_err() {
