@@ -520,3 +520,133 @@ async fn final_part_completes_while_other_sessions_fill_the_share() {
 
     manager.shutdown().await;
 }
+
+/// Body of `len` bytes made of whole PONG frames.
+fn pongs(len: usize) -> Bytes {
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    pong.iter().copied().cycle().take(len).collect()
+}
+
+/// An applied single-part operation whose acknowledgement was lost is
+/// replayed re-sliced into more URL-only parts: the completed record yields
+/// to the new layout and the canonical claim verifies the digest.
+#[tokio::test]
+async fn resliced_replay_of_a_completed_operation_verifies_like_post() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    let body = pongs(40);
+    let Ok(GetUpOffer::Complete { body: applied, .. }) =
+        session.offer_get_up(None, 1, Some(0), 0, 1, body.clone())
+    else {
+        panic!("a single part completes");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(claim.process(&applied).await, Ok(1));
+
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 0, 2, body.slice(..32)),
+        Ok(GetUpOffer::Pending(0))
+    ));
+    let Ok(GetUpOffer::Complete { body: replayed, .. }) =
+        session.offer_get_up(None, 1, Some(0), 1, 2, body.slice(32..))
+    else {
+        panic!("the re-sliced replay reassembles");
+    };
+    assert_eq!(replayed, body);
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(claim.process(&replayed).await, Ok(1));
+    assert!(!session.state.lock().closed);
+    // A layout with fewer parts is never a re-slice of this operation.
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 0, 1, body),
+        Err(GetUpReject::Decoy)
+    ));
+
+    manager.shutdown().await;
+}
+
+/// A re-sliced replay with other bytes closes the session like a POST body
+/// with another digest.
+#[tokio::test]
+async fn resliced_replay_with_another_digest_closes_the_session() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    let Ok(GetUpOffer::Complete { body: applied, .. }) =
+        session.offer_get_up(None, 1, Some(0), 0, 1, pongs(40))
+    else {
+        panic!("a single part completes");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(claim.process(&applied).await, Ok(1));
+
+    let other = pongs(48);
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 0, 2, other.slice(..32)),
+        Ok(GetUpOffer::Pending(0))
+    ));
+    let Ok(GetUpOffer::Complete { body, .. }) =
+        session.offer_get_up(None, 1, Some(0), 1, 2, other.slice(32..))
+    else {
+        panic!("the re-sliced replay reassembles");
+    };
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(
+        claim.process(&body).await,
+        Err(ConveyorError::Manager(ManagerError::Protocol))
+    );
+    assert!(session.state.lock().closed);
+
+    manager.shutdown().await;
+}
+
+/// Parts of a header layout that reached the server before the page fell
+/// back are superseded by the URL-only re-slice, their leases released, and
+/// late parts of the abandoned layout cannot take the record back.
+#[tokio::test]
+async fn resliced_operation_supersedes_a_pending_layout() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    let free = manager.body_bytes_available();
+    let body = pongs(96);
+    for part in 0..2u32 {
+        let chunk = body.slice(part as usize * 32..(part as usize + 1) * 32);
+        assert!(matches!(
+            session.offer_get_up(None, 1, Some(0), part, 3, chunk),
+            Ok(GetUpOffer::Pending(_))
+        ));
+    }
+    for part in 0..5u32 {
+        let chunk = body.slice(part as usize * 16..(part as usize + 1) * 16);
+        assert!(matches!(
+            session.offer_get_up(None, 1, Some(0), part, 6, chunk),
+            Ok(GetUpOffer::Pending(_))
+        ));
+        if part == 0 {
+            // A late part of the abandoned layout decoys and leaves the new
+            // assembly in place.
+            assert!(matches!(
+                session.offer_get_up(None, 1, Some(0), 1, 3, body.slice(32..64)),
+                Err(GetUpReject::Decoy)
+            ));
+        }
+    }
+    let Ok(GetUpOffer::Complete {
+        body: assembled, ..
+    }) = session.offer_get_up(None, 1, Some(0), 5, 6, body.slice(80..))
+    else {
+        panic!("the re-sliced operation completes");
+    };
+    assert_eq!(assembled, body);
+    let claim = session.claim_conveyor(None, 1, Some(0)).unwrap().unwrap();
+    assert_eq!(claim.process(&assembled).await, Ok(1));
+    drop(assembled);
+
+    // Every lease of both layouts is released once the record retires.
+    let expired = Instant::now() + Duration::from_secs(95);
+    touch_peer_at(&session, expired);
+    assert!(!session.close_if_due(expired));
+    assert_eq!(committed_bytes(&session), 0);
+    assert_eq!(manager.body_bytes_available(), free);
+
+    manager.shutdown().await;
+}

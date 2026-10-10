@@ -628,3 +628,160 @@ Connection: close
     generation.stop_sessions().await;
     generation.stop_background_tasks().await;
 }
+
+/// Creates one GET session with the negotiated uplink window of 4.
+async fn window_session(
+    listener: &TcpListener,
+    runtime: &Arc<WebProcessRuntime>,
+    capability: [u8; 32],
+) -> String {
+    let bootstrap = bootstrap(listener, runtime, capability).await;
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+    let create = get_request(
+        listener,
+        runtime,
+        &format!("/api/v1/session?t={bootstrap}&n=1&w=4&d={}", b64(&hello)),
+        "",
+    )
+    .await;
+    let headers = split_response(&create).0;
+    assert!(headers.starts_with(b"HTTP/1.1 200"));
+    response_header(headers, "x-session-token").to_string()
+}
+
+/// Sends `body` as sequence 1 sliced into `total` parts of `chunk` bytes,
+/// URL-only or with `url_chars` URL characters and payload header lines.
+async fn send_layout(
+    listener: &TcpListener,
+    runtime: &Arc<WebProcessRuntime>,
+    session: &str,
+    body: &[u8],
+    chunk: usize,
+    url_chars: Option<usize>,
+    parts: std::ops::Range<usize>,
+    nonce: u64,
+) -> Vec<Vec<u8>> {
+    let total = body.len().div_ceil(chunk);
+    let mut responses = Vec::new();
+    for part in parts {
+        let bytes = &body[part * chunk..((part + 1) * chunk).min(body.len())];
+        let encoded = b64(bytes);
+        let (data, lines) = match url_chars {
+            Some(url_chars) => split_encoded(&encoded, url_chars, LINE),
+            None => (encoded, Vec::new()),
+        };
+        let layout = if total > 1 {
+            format!("&p={part}&pn={total}")
+        } else {
+            String::new()
+        };
+        responses.push(
+            get_request(
+                listener,
+                runtime,
+                &format!(
+                    "/api/v1/up?t={session}&n={}&s=1&u=0&d={data}{layout}",
+                    nonce + part as u64
+                ),
+                &header_lines(&indexed(&lines)),
+            )
+            .await,
+        );
+    }
+    responses
+}
+
+#[tokio::test]
+async fn get_url_reslice_replays_an_applied_header_operation() {
+    let capability = [81u8; 32];
+    let generation = test_runtime_generation(
+        1,
+        header_runtime_config(capability, WebCarrier::Https, 40000),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let session = window_session(&listener, &runtime, capability).await;
+
+    // One 12 KB header-carrying request applies sequence 1, but the page
+    // never sees the answer and falls back to URL-only fragments.
+    let body = open_data_body(1, 12000);
+    let applied = send_layout(
+        &listener,
+        &runtime,
+        &session,
+        &body,
+        12000,
+        Some(4000),
+        0..1,
+        10,
+    )
+    .await;
+    assert_eq!(
+        response_header(split_response(&applied[0]).0, "x-up-ack"),
+        "1"
+    );
+
+    let replay = send_layout(&listener, &runtime, &session, &body, 3000, None, 0..4, 20).await;
+    for (part, response) in replay.iter().enumerate() {
+        let (headers, _) = split_response(response);
+        assert!(
+            headers.starts_with(b"HTTP/1.1 204"),
+            "part {part}: {}",
+            String::from_utf8_lossy(status(response))
+        );
+    }
+    assert_eq!(
+        response_header(split_response(&replay[3]).0, "x-up-ack"),
+        "1"
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn get_url_reslice_supersedes_stored_header_parts() {
+    let capability = [82u8; 32];
+    let generation = test_runtime_generation(
+        1,
+        header_runtime_config(capability, WebCarrier::Https, 40000),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let session = window_session(&listener, &runtime, capability).await;
+
+    // Two of three header-layout parts reached the server before the edge
+    // dropped the connection and the page re-sliced URL-only.
+    let body = open_data_body(1, 60000);
+    let stored = send_layout(
+        &listener,
+        &runtime,
+        &session,
+        &body,
+        20000,
+        Some(4000),
+        0..2,
+        10,
+    )
+    .await;
+    for response in &stored {
+        assert!(split_response(response).0.starts_with(b"HTTP/1.1 204"));
+    }
+    let resliced = send_layout(&listener, &runtime, &session, &body, 5000, None, 0..12, 20).await;
+    for (part, response) in resliced.iter().enumerate() {
+        assert!(
+            split_response(response).0.starts_with(b"HTTP/1.1 204"),
+            "part {part}: {}",
+            String::from_utf8_lossy(status(response))
+        );
+    }
+    assert_eq!(
+        response_header(split_response(&resliced[11]).0, "x-up-ack"),
+        "1"
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}

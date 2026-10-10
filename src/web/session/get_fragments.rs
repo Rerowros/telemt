@@ -133,6 +133,19 @@ impl GetFragments {
         }
     }
 
+    /// Detaches the pending or completed record of one operation whose
+    /// layout a re-sliced replay supersedes.
+    fn retire_record(&mut self, key: (Option<u32>, u64), retired: &mut GetFragments) {
+        if let Some(assembly) = self.pending.remove(&key) {
+            self.committed_bytes = self.committed_bytes.saturating_sub(assembly.commitment);
+            retired.pending.insert(key, assembly);
+        }
+        if let Some(completed) = self.completed.remove(&key) {
+            self.committed_bytes = self.committed_bytes.saturating_sub(completed.commitment);
+            retired.completed.insert(key, completed);
+        }
+    }
+
     /// Detaches completed records superseded by the next legacy sequence.
     fn retire_below(&mut self, lane: Option<u32>, sequence: u64, retired: &mut GetFragments) {
         for (key, completed) in self

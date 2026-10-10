@@ -107,6 +107,27 @@ impl WebSession {
             if state.closed || self.ensure_carrier_active_locked(&state).is_err() {
                 return Err(GetUpReject::Decoy);
             }
+            // A page that leaves GET header mode resends the operation sliced
+            // URL-only, which always yields more parts than the header layout.
+            // Such a re-slice supersedes the record of the earlier layout: a
+            // pending assembly is dropped and its leases released, a completed
+            // record retires so the new layout replays through reassembly and
+            // the canonical digest check. A layout with fewer parts (a late
+            // part of the abandoned layout) still decoys, so layouts never
+            // flip back and forth.
+            if state
+                .get_fragments
+                .completed
+                .get(&key)
+                .is_some_and(|record| record.total_parts < total)
+                || state
+                    .get_fragments
+                    .pending
+                    .get(&key)
+                    .is_some_and(|assembly| assembly.total_parts < total)
+            {
+                state.get_fragments.retire_record(key, &mut retired);
+            }
             if let Some(completed) = state.get_fragments.completed.get(&key) {
                 if completed.total_parts != total {
                     return Err(GetUpReject::Decoy);
