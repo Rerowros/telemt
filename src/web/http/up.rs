@@ -150,6 +150,7 @@ async fn handle_get_up(
         }
         Ok(GetUpOffer::Complete { body, budget }) => (body, budget),
         Err(GetUpReject::Busy) => return service_unavailable(),
+        Err(GetUpReject::Stale) => return carrier_empty(StatusCode::CONFLICT),
         Err(GetUpReject::Decoy) => {
             return serve_decoy(request, vhost, true, &runtime).await;
         }
@@ -175,7 +176,9 @@ async fn handle_get_up(
             Some(deadline) => {
                 match deadline.lease_for(Duration::from_secs(session.timeouts().body_secs)) {
                     Some(lease) => Some(lease),
-                    None => return service_unavailable(),
+                    None => {
+                        return service_unavailable();
+                    }
                 }
             }
             None => None,

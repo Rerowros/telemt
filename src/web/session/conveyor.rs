@@ -120,6 +120,24 @@ impl ConveyorState {
             .map_or((0, 0), |channel| (channel.confirmed, channel.committed))
     }
 
+    /// Advances one existing channel's client-confirmed floor from a
+    /// validated GET hint (`confirmed <= committed`), exactly as the next
+    /// canonical claim would, so late duplicates below it stay stale.
+    pub(super) fn confirm(&mut self, lane: Option<u32>, confirmed: u64) {
+        let Some(channel) = self.channels.get_mut(&lane) else {
+            return;
+        };
+        if confirmed <= channel.confirmed || confirmed > channel.committed {
+            return;
+        }
+        channel.confirmed = confirmed;
+        for slot in &mut channel.slots {
+            if slot.is_some_and(|slot| slot.sequence <= confirmed) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Returns the negotiated window used to bound fragment records per lane.
     pub(super) fn offer_window(&self) -> usize {
         usize::from(self.offered.max(1))

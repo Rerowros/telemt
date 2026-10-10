@@ -316,6 +316,70 @@ async fn get_carrier_malformed_query_never_reaches_http_upstream() {
 }
 
 #[tokio::test]
+async fn get_carrier_failed_injection_never_leaks_headers() {
+    let capability = [44u8; 32];
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = get_runtime_config(capability, WebCarrier::Https);
+    let runtime_config = Arc::get_mut(config.web.runtime.as_mut().unwrap()).unwrap();
+    let vhost = Arc::get_mut(runtime_config.vhosts.get_mut(HOST).unwrap()).unwrap();
+    vhost.decoy = WebRuntimeDecoy::HttpUpstream {
+        addr: origin.local_addr().unwrap(),
+        authority: "decoy.example".to_string(),
+    };
+    // Two bridge pages are issued: the decoyed probe and the valid retry.
+    config.web.limits.max_bootstraps_per_ip = 2;
+    let generation = test_runtime_generation(1, config);
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token = bootstrap(&listener, &runtime, capability).await;
+    let hello = b64(&frame::encode(FrameType::Hello, 0, &[1]));
+
+    // A header-safe capability value precedes one that cannot become a
+    // header: normalization must fail before any carrier header is inserted.
+    let broken = format!(
+        "GET /api/v1/session?t={token}&n=1&k=https&f=%0a&d={hello} HTTP/1.1\r\nHost: {HOST}\r\nX-Forwarded-For: 192.0.2.10\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (response, captured) = tokio::join!(request(&listener, &runtime, broken), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), capture_upstream(&origin))
+            .await
+            .ok()
+    });
+    assert!(response.starts_with(b"HTTP/1.1 404"));
+    if let Some(captured) = captured {
+        let forwarded = std::str::from_utf8(&captured).unwrap();
+        for leaked in [
+            "authorization",
+            "x-carrier-",
+            "x-up-seq",
+            "x-telemt-up-window",
+        ] {
+            assert!(
+                !forwarded.to_lowercase().contains(leaked),
+                "injected carrier header leaked to the decoy upstream: {leaked}"
+            );
+        }
+    }
+
+    // The same route with every value header-safe normalizes cleanly.
+    let second = bootstrap(&listener, &runtime, capability).await;
+    let valid = format!(
+        "GET /api/v1/session?t={second}&n=2&d={hello} HTTP/1.1\r\nHost: {HOST}\r\nX-Forwarded-For: 192.0.2.10\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let response = request(&listener, &runtime, valid).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "got: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
 async fn get_carrier_recovery_nonce_is_unique_and_scoped() {
     let capability = [43u8; 32];
     let generation = test_runtime_generation(1, get_runtime_config(capability, WebCarrier::Https));

@@ -25,6 +25,7 @@ const MAX_WEB_FRAMES_PER_BODY: usize = 4096;
 const MAX_WEB_TOMBSTONES_PER_SESSION: usize = 4096;
 const MAX_WEB_MEMORY_ENVELOPE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_WEB_GET_URL_BYTES: usize = 7500;
+const MAX_WEB_GET_PARALLEL_PARTS: usize = 16;
 
 /// Validates WEB policy and resource bounds before building runtime state.
 pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
@@ -192,6 +193,9 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     }
     if !(1024..=MAX_WEB_GET_URL_BYTES).contains(&limits.get_url_bytes) {
         return config_error("web.limits.get_url_bytes must be within [1024, 7500]");
+    }
+    if !(1..=MAX_WEB_GET_PARALLEL_PARTS).contains(&limits.get_parallel_parts) {
+        return config_error("web.limits.get_parallel_parts must be within [1, 16]");
     }
     if !(1..=MAX_WEB_FRAME_BYTES).contains(&limits.max_frame_payload_bytes) {
         return config_error("web.limits.max_frame_payload_bytes must be within [1, 1048576]");

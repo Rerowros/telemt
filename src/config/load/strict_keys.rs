@@ -280,6 +280,7 @@ const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "max_header_bytes",
     "max_body_bytes",
     "get_url_bytes",
+    "get_parallel_parts",
     "max_frame_payload_bytes",
     "carrier_batch_bytes",
     "max_frames_per_body",

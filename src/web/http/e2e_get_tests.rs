@@ -18,8 +18,9 @@ use crate::web::http::serve_connection;
 use crate::web::manager::WebProcessRuntime;
 
 /// Runs the GET-carrier fixture endpoint until the fixture TTL elapses.
-/// TELEMT_WEB_GET_E2E_ECHO=1 additionally switches the session backend to a
-/// byte-echo loop so the browser roundtrip does not need a DC upstream.
+/// TELEMT_WEB_GET_E2E_ECHO=1 additionally switches the session backend to the
+/// marker-dispatched fixture loop so the browser roundtrip does not need a DC
+/// upstream; TELEMT_WEB_E2E_METHOD=post selects the canonical body carrier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "fixture for tools/web-get-e2e; run via run.sh"]
 async fn get_carrier_browser_fixture() {
@@ -42,7 +43,12 @@ async fn get_carrier_browser_fixture() {
 
     let capability = [7u8; 32];
     let mut config = runtime_config(capability, carrier);
-    config.web.carrier_method = WebCarrierMethod::Get;
+    // TELEMT_WEB_E2E_METHOD=post keeps the canonical body carrier for the
+    // baseline bench cells that must not traverse the GET-only edge.
+    config.web.carrier_method = match std::env::var("TELEMT_WEB_E2E_METHOD").as_deref() {
+        Ok("post") => WebCarrierMethod::Post,
+        _ => WebCarrierMethod::Get,
+    };
     config.web.timeouts.long_poll_secs = 30;
     config.web.limits.max_bootstraps_per_ip = 64;
     let generation = test_runtime_generation(1, config);

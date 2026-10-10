@@ -106,6 +106,10 @@ pub struct WebLimitsConfig {
     /// carrier requests.
     #[serde(default = "default_web_get_url_bytes")]
     pub get_url_bytes: usize,
+    /// GET uplink fragments allowed in flight for one operation and as the
+    /// per-page concurrency seed on multiplexed edges.
+    #[serde(default = "default_web_get_parallel_parts")]
+    pub get_parallel_parts: usize,
     /// Maximum payload carried by one WEB frame.
     #[serde(default = "default_web_max_frame_payload_bytes")]
     pub max_frame_payload_bytes: usize,
@@ -249,6 +253,7 @@ impl Default for WebLimitsConfig {
             max_header_bytes: default_web_max_header_bytes(),
             max_body_bytes: default_web_max_body_bytes(),
             get_url_bytes: default_web_get_url_bytes(),
+            get_parallel_parts: default_web_get_parallel_parts(),
             max_frame_payload_bytes: default_web_max_frame_payload_bytes(),
             carrier_batch_bytes: default_web_carrier_batch_bytes(),
             max_frames_per_body: default_web_max_frames_per_body(),

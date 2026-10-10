@@ -11,6 +11,9 @@ const recoverySupport=globalThis.TelemtBridgeRecovery;if(!recoverySupport)throw 
 const carrierMethod='__CARRIER_METHOD__';
 // The configured URL envelope is page-owned like the carrier method.
 const getUrlBytes=__GET_URL_BYTES__;
+// GET uplink fragment parallelism is page-owned; the edge-protocol scheduler
+// inside the request runtime adapts the effective cap.
+const getParallelParts=__GET_PARALLEL_PARTS__;
 let negotiationEnabled=__NEGOTIATION_ENABLED__,candidateCount=__CANDIDATE_COUNT__,candidateDeadlines=[__CARRIER_DEADLINES__];
 let longPollMs=__LONG_POLL_SECS__*1000,bridgeRequestMs=__BRIDGE_REQUEST_SECS__*1000,bridgeRetryMs=__BRIDGE_RETRY_SECS__*1000;
 let bridgeRecoveryMs=__BRIDGE_RECOVERY_SECS__*1000,websocketOpenMs=__WEBSOCKET_OPEN_SECS__*1000,reconnectGraceMs=__RECONNECT_GRACE_SECS__*1000;
@@ -34,7 +37,7 @@ const socketURL=()=>relayBase.replace(/^https:/,'wss:')+'/api/v1/ws';
 const requestClient=requestSupport.create({
  base:()=>relayBase,closed:()=>closed,retryMs:()=>bridgeRetryMs,longPollMs:()=>longPollMs,requestMs:()=>bridgeRequestMs,
  batchLimit:()=>batchLimit,read:(response,limit,exact,signal)=>responseBody.read(response,limit,exact,signal),cancel:responseBody.cancel,
- method:()=>carrierMethod,getUrlBytes:()=>getUrlBytes,
+ method:()=>carrierMethod,getUrlBytes:()=>getUrlBytes,parallelParts:()=>getParallelParts,
  failure,reason:failureReason,retrying:()=>status('reconnecting')
 });
 const options=requestClient.options,pause=requestClient.pause,request=requestClient.send;

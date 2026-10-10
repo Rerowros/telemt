@@ -63,7 +63,7 @@ pub(crate) use observability::{WebCapacityResourceStatus, WebCapacitySnapshot};
 // Asynchronous bounded close operations isolate mutation lifecycle from HTTP requests.
 mod control;
 use budget::WebDataBudget;
-pub(crate) use budget::WebSocketBudgetLease;
+pub(crate) use budget::{GetBodyLease, WebSocketBudgetLease};
 pub(crate) use control::{CloseOperationSelector, ControlError};
 pub(crate) use negotiation::{
     CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
@@ -233,6 +233,9 @@ pub(crate) struct WebProcessRuntime {
     lane_aux_polls: Arc<Semaphore>,
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
+    /// GET reassembly share of `body_bytes`, so retained GET records can
+    /// never take the whole body budget from POST carriers.
+    get_body_bytes: Arc<Semaphore>,
     conveyor_waiters: Arc<Semaphore>,
     stream_handshakes: Arc<Semaphore>,
     websocket_connections: Arc<Semaphore>,
@@ -303,6 +306,7 @@ impl WebProcessRuntime {
             lane_aux_polls: Arc::new(Semaphore::new(lane_aux_poll_limit)),
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
             body_bytes: Arc::new(Semaphore::new(limits.max_body_bytes_global)),
+            get_body_bytes: Arc::new(Semaphore::new(budget::get_body_share(&limits))),
             conveyor_waiters: Arc::new(Semaphore::new(crate::web::session::conveyor_waiter_limit(
                 &limits,
             ))),

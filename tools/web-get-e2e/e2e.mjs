@@ -4,6 +4,7 @@
 // every carrier request is a GET without a body within the URL budget.
 //
 // usage: node e2e.mjs <capability-b64> [carrier] [outDir]
+//        node e2e.mjs <capability-b64> <carrier> <outDir> bench <method> <rttMs> <edgeOrigin> <label>
 // Credentials are never logged: audit entries keep method/path/length only.
 
 import { chromium } from "playwright";
@@ -11,7 +12,8 @@ import fs from "node:fs";
 import https from "node:https";
 import path from "node:path";
 
-const [cap, carrier = "https", outDir = "artifacts"] = process.argv.slice(2);
+const [cap, carrier = "https", outDir = "artifacts", mode = "e2e"] =
+  process.argv.slice(2);
 if (!cap) {
   console.error("usage: node e2e.mjs <capability-b64> [carrier] [outDir]");
   process.exit(2);
@@ -22,6 +24,7 @@ const ORIGIN = "https://proxy.example.com";
 const PARENT = "http://127.0.0.1:18000";
 const URL_BUDGET = 7168;
 const TOTAL = 1024 * 1024;
+const BIG_TOTAL = 12 * 1024 * 1024;
 const CHUNK = 256 * 1024;
 const LONG_POLL_MIN_MS = 29000;
 const LONG_POLL_MAX_MS = 45000;
@@ -31,6 +34,7 @@ const results = {
   probes: {},
   audit: { requests: 0, apiRequests: 0, violations: [], failed: [] },
   roundtrip: null,
+  bigUplink: null,
   longPollMs: null,
   ok: false,
 };
@@ -126,6 +130,9 @@ async function main() {
         path: url.pathname,
         urlBytes: req.url().length,
         body: req.postData() !== null,
+        create:
+          url.pathname.endsWith("/api/v1/session") &&
+          url.searchParams.get("op") !== "close",
       };
       audit.push(entry);
       pending.set(req, Date.now());
@@ -173,6 +180,31 @@ async function main() {
       return `ok ${want.length} bytes`;
     }, TOTAL);
 
+    // A 12 MiB single-file uplink keeps several conveyor windows of
+    // reassembly in flight; the sender honours the per-stream send window
+    // and the echo is verified bytewise afterwards.
+    await page.evaluate(() => window.__e2e.resetDown());
+    await page.evaluate(
+      ({ total, chunk }) =>
+        window.__e2e.bench.uploadWindowed(2, total, chunk, 300000),
+      { total: BIG_TOTAL, chunk: CHUNK },
+    );
+    await page.evaluate(
+      (total) =>
+        window.__e2e.waitFor(() => window.__e2e.downBytes >= total, 300000),
+      BIG_TOTAL,
+    );
+    results.bigUplink = await page.evaluate((total) => {
+      const got = window.__e2e.collectData();
+      const want = window.__e2e.makePayload(total);
+      if (got.length !== want.length)
+        return `length ${got.length} != ${want.length}`;
+      for (let i = 0; i < want.length; i++) {
+        if (got[i] !== want[i]) return `byte ${i}: ${got[i]} != ${want[i]}`;
+      }
+      return `ok ${want.length} bytes`;
+    }, BIG_TOTAL);
+
     // With the stream idle, the next /api/v1/down poll is held for the
     // configured 30 s long-poll window before answering.
     const idleStart = Date.now();
@@ -212,6 +244,10 @@ async function main() {
       e.path.includes("/api/"),
     ).length;
     results.audit.failed = failures;
+    // Session recreation shows up as an extra create; a carrier recovery
+    // re-fetches the bridge document with a fresh nonce.
+    results.audit.sessionCreates = audit.filter((e) => e.create).length;
+    results.audit.bridgeFetches = audit.filter((e) => e.path === "/").length;
   } finally {
     await browser.close();
   }
@@ -226,6 +262,9 @@ async function main() {
     ["long URI -> 414", probes.long_uri === 414],
     ["big header -> 400", probes.big_header === 400],
     ["1MiB roundtrip", String(results.roundtrip).startsWith("ok")],
+    ["12MiB GET uplink", String(results.bigUplink).startsWith("ok")],
+    ["one session create", results.audit.sessionCreates === 1],
+    ["no bridge recovery", results.audit.bridgeFetches === 1],
     [
       "30s long poll",
       results.longPollMs !== null && results.longPollMs >= LONG_POLL_MIN_MS,
@@ -242,6 +281,186 @@ async function main() {
     `requests=${results.audit.requests} api=${results.audit.apiRequests} longPollMs=${results.longPollMs}`,
   );
   console.log(`roundtrip=${results.roundtrip}`);
+}
+
+function percentiles(times) {
+  const sorted = [...times].sort((a, b) => a - b);
+  const pick = (q) =>
+    sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+  return {
+    n: sorted.length,
+    p50: pick(0.5),
+    p95: pick(0.95),
+    mean: sorted.reduce((a, b) => a + b, 0) / (sorted.length || 1),
+  };
+}
+
+// Phase-0/1 carrier benchmark cell: one bridge session behind the chosen edge
+// measures sink upload (~4 MiB), source download (8 MiB), and small-frame echo
+// roundtrips idle and under concurrent upload. Latency is emulated through
+// CDP so no extra containers are needed.
+async function bench(method, rttMs, edge, label) {
+  const result = {
+    label,
+    carrier,
+    method,
+    edge,
+    rttMs,
+    ok: false,
+  };
+  const browser = await chromium.launch({
+    args: ["--host-resolver-rules=MAP proxy.example.com 127.0.0.1"],
+  });
+  try {
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await context.newPage();
+    const cdp = await context.newCDPSession(page);
+    await cdp.send("Network.enable");
+    if (rttMs > 0) {
+      await cdp.send("Network.emulateNetworkConditions", {
+        offline: false,
+        latency: rttMs,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+      });
+    }
+    const consoleLog = fs.createWriteStream(
+      path.join(outDir, `console-bench-${label}.log`),
+    );
+    page.on("console", (msg) =>
+      consoleLog.write(`[${msg.type()}] ${msg.text()}\n`),
+    );
+    const audit = [];
+    page.on("request", (req) => {
+      const url = new URL(req.url());
+      if (url.hostname !== "proxy.example.com") return;
+      audit.push({
+        method: req.method(),
+        path: url.pathname,
+        urlBytes: req.url().length,
+        body: req.postData() !== null,
+      });
+    });
+
+    await page.goto(
+      `${PARENT}/?cap=${encodeURIComponent(cap)}&origin=${encodeURIComponent(edge)}&base=${encodeURIComponent("/")}`,
+    );
+    await page.evaluate(() => window.__e2e.start());
+    await page.evaluate(() => window.__e2e.hello());
+    // The carrier commits on the first uplink probe, same as the e2e flow.
+    await page.evaluate(() => window.__e2e.open(1));
+    await page.evaluate(
+      (chunk) => window.__e2e.data(1, window.__e2e.makePayload(chunk)),
+      CHUNK,
+    );
+    await page.evaluate(() =>
+      window.__e2e.waitFor(() => window.__e2e.status === "connected", 120000),
+    );
+
+    // Uplink stays comfortably below the initial 4 MiB stream window so no
+    // WINDOW credit pacing is needed before the protocol can grant it; the
+    // sink marker and frame overhead also count against the same window.
+    const upTotal = 4 * 1024 * 1024 - 128 * 1024;
+    const up = await page.evaluate(
+      (total) => window.__e2e.bench.upload(11, total, 600000),
+      upTotal,
+    );
+    const down = await page.evaluate(() =>
+      window.__e2e.bench.download(12, 8 * 1024 * 1024, 600000),
+    );
+    const idle = await page.evaluate(() =>
+      window.__e2e.bench.ping(13, 25, 32, 120000),
+    );
+    // GET cells size the load upload to outlast the ping series: with a fast
+    // GET uplink a fixed 1 MiB finishes early and the tail of the series then
+    // measures an idle carrier. Slow uplinks keep the original 1 MiB; the
+    // cap stays below the initial 4 MiB stream window like the upload above.
+    // POST baseline cells keep the fixed 1 MiB so they stay comparable with
+    // earlier runs of the unchanged POST carrier.
+    const pingSeriesMs = 25 * percentiles(idle).p50;
+    const loadBytes =
+      method === "get"
+        ? Math.min(
+            3.5 * 1024 * 1024,
+            Math.max(
+              1024 * 1024,
+              Math.ceil((up.bytes / up.ms) * pingSeriesMs * 1.5),
+            ),
+          )
+        : 1024 * 1024;
+    const load = await page.evaluate(async (total) => {
+      const upload = window.__e2e.bench.upload(14, total, 300000);
+      const times = await window.__e2e.bench.ping(15, 25, 32, 120000);
+      await upload;
+      return times;
+    }, loadBytes);
+    await page.evaluate(() => window.__e2e.closeSession());
+
+    result.uplink = {
+      bytes: up.bytes,
+      ms: Math.round(up.ms),
+      mbps: +(up.bytes / (up.ms / 1000) / (1024 * 1024)).toFixed(2),
+    };
+    result.downlink = {
+      bytes: down.bytes,
+      ms: Math.round(down.ms),
+      mbps: +(down.bytes / (down.ms / 1000) / (1024 * 1024)).toFixed(2),
+      badByte: down.badByte,
+    };
+    result.pingIdle = percentiles(idle);
+    result.pingLoad = percentiles(load);
+    result.loadBytes = loadBytes;
+    // Raw samples keep p95 outliers attributable across repeated cells.
+    result.pingSamples = {
+      idle: idle.map((ms) => Math.round(ms)),
+      load: load.map((ms) => Math.round(ms)),
+    };
+    const api = audit.filter((e) => e.path.includes("/api/"));
+    result.audit = {
+      requests: audit.length,
+      apiRequests: api.length,
+      violations:
+        method === "get"
+          ? api.flatMap((e) =>
+              [
+                e.method !== "GET" ? `non-GET ${e.method} ${e.path}` : null,
+                e.body ? `body on ${e.path}` : null,
+                e.urlBytes > URL_BUDGET
+                  ? `url ${e.urlBytes}B > ${URL_BUDGET} on ${e.path}`
+                  : null,
+              ].filter(Boolean),
+            )
+          : [],
+    };
+    result.ok =
+      result.audit.violations.length === 0 &&
+      down.badByte < 0 &&
+      idle.length === 25;
+  } finally {
+    await browser.close();
+  }
+  fs.writeFileSync(
+    path.join(outDir, `bench-${label}.json`),
+    JSON.stringify(result, null, 2) + "\n",
+  );
+  console.log(`bench ${label}: ${JSON.stringify(result)}`);
+  process.exit(result.ok ? 0 : 1);
+}
+
+if (mode === "bench") {
+  const [
+    benchMethod = "get",
+    benchRtt = "0",
+    benchEdge = "https://proxy.example.com",
+    benchLabel = "",
+  ] = process.argv.slice(6);
+  const label = benchLabel || `${carrier}-${benchMethod}-r${benchRtt}`;
+  try {
+    await bench(benchMethod, Number(benchRtt) || 0, benchEdge, label);
+  } catch (error) {
+    console.error(`bench error: ${(error && error.stack) || error}`);
+    process.exit(1);
+  }
 }
 
 try {

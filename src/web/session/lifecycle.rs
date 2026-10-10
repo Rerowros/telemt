@@ -246,9 +246,12 @@ impl WebSession {
         }
         let expired_fragments = {
             let mut state = self.state.lock();
+            // Assemblies and replay records outlive a single request timeout:
+            // the bridge retries fragments within the whole-operation retry
+            // budget, so the expiry bound is bridge_retry_secs.
             state
                 .get_fragments
-                .expire(now, Duration::from_secs(self.timeouts.bridge_request_secs))
+                .expire(now, Duration::from_secs(self.timeouts.bridge_retry_secs))
         };
         drop(expired_fragments);
         let Some(released) = self.begin_idle_close(now) else {

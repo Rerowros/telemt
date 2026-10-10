@@ -31,6 +31,27 @@ struct BudgetState {
     closed: bool,
 }
 
+/// Part of `max_body_bytes_global` retained GET reassembly may hold: half of
+/// it, but never less than one full body, so POST always keeps the rest.
+pub(crate) fn get_body_share(limits: &WebLimitsConfig) -> usize {
+    (limits.max_body_bytes_global / 2).max(limits.max_body_bytes.min(limits.max_body_bytes_global))
+}
+
+/// Body bytes held by GET reassembly: one charge against the global body
+/// budget and the same charge against the GET share, released together.
+pub(crate) struct GetBodyLease {
+    share: OwnedSemaphorePermit,
+    global: OwnedSemaphorePermit,
+}
+
+impl GetBodyLease {
+    /// Folds another lease taken from the same manager into this one.
+    pub(crate) fn merge(&mut self, other: GetBodyLease) {
+        self.share.merge(other.share);
+        self.global.merge(other.global);
+    }
+}
+
 /// Process-owned byte and item governor shared by queues and WebSocket I/O.
 pub(super) struct WebDataBudget {
     limits: WebLimitsConfig,
@@ -383,23 +404,35 @@ impl WebProcessRuntime {
     }
 
     /// Reserves global body bytes for retained GET reassembly without a reader.
-    pub(crate) fn try_body_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let Some(bytes) = u32::try_from(bytes).ok() else {
+    /// The bytes also come out of the GET share, so POST keeps the rest.
+    pub(crate) fn try_body_bytes(&self, bytes: usize) -> Option<GetBodyLease> {
+        let lease = u32::try_from(bytes).ok().and_then(|bytes| {
+            let share = Arc::clone(&self.get_body_bytes)
+                .try_acquire_many_owned(bytes)
+                .ok()?;
+            let global = Arc::clone(&self.body_bytes)
+                .try_acquire_many_owned(bytes)
+                .ok()?;
+            Some(GetBodyLease { share, global })
+        });
+        if lease.is_none() {
             self.record_limit_hit();
             self.telemetry
                 .record_rejection(WebRejectionReason::BodyBytesCapacity);
-            return None;
-        };
-        let Some(lease) = Arc::clone(&self.body_bytes)
-            .try_acquire_many_owned(bytes)
-            .ok()
-        else {
-            self.record_limit_hit();
-            self.telemetry
-                .record_rejection(WebRejectionReason::BodyBytesCapacity);
-            return None;
-        };
-        Some(lease)
+        }
+        lease
+    }
+
+    /// Reports the free global body-byte capacity for accounting assertions.
+    #[cfg(test)]
+    pub(crate) fn body_bytes_available(&self) -> usize {
+        self.body_bytes.available_permits()
+    }
+
+    /// Reports the free GET share of the body budget for accounting assertions.
+    #[cfg(test)]
+    pub(crate) fn get_body_bytes_available(&self) -> usize {
+        self.get_body_bytes.available_permits()
     }
 
     /// Reserves transient bytes while one downlink batch replaces queued frames.

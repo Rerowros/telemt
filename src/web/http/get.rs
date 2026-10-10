@@ -424,6 +424,12 @@ pub(super) fn normalize(
     {
         injected.push((header::CONTENT_TYPE, content_type.to_string()));
     }
+    // Every fallible conversion finishes before any mutation lands: a partial
+    // insert would leak carrier headers into the decoy path on failure.
+    let Ok(uri) = request.uri().path().parse() else {
+        return Err(());
+    };
+    let mut prepared = Vec::with_capacity(injected.len());
     for (name, value) in injected {
         if request.headers().contains_key(&name) {
             continue;
@@ -431,6 +437,9 @@ pub(super) fn normalize(
         let Ok(value) = HeaderValue::from_str(&value) else {
             return Err(());
         };
+        prepared.push((name, value));
+    }
+    for (name, value) in prepared {
         request.headers_mut().insert(name, value);
     }
     if let Some(parts) = parts_extension {
@@ -442,9 +451,6 @@ pub(super) fn normalize(
     *request.method_mut() = match operation {
         Operation::Close => Method::DELETE,
         _ => Method::POST,
-    };
-    let Ok(uri) = request.uri().path().parse() else {
-        return Err(());
     };
     *request.uri_mut() = uri;
     Ok(())

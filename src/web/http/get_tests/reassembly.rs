@@ -294,21 +294,15 @@ async fn get_carrier_completed_replay_rejects_changed_parts() {
 }
 
 #[tokio::test]
-async fn get_carrier_pending_bytes_bound_blocks_new_parts() {
+async fn get_carrier_commitment_cap_returns_busy_until_capacity_frees() {
     let capability = [34u8; 32];
-    let mut config = get_runtime_config(capability, WebCarrier::Https);
-    // Three Pong frames per part: each operation fits the bound alone while
-    // two pending first parts exceed it together.
-    let pong = frame::encode(FrameType::Pong, 0, &[]);
-    let head: Vec<u8> = pong.iter().copied().cycle().take(24).collect();
-    let tail = pong.to_vec();
-    config.web.limits.max_body_bytes = head.len() + tail.len();
+    let config = get_runtime_config(capability, WebCarrier::Https);
     let generation = test_runtime_generation(1, config);
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bootstrap = bootstrap(&listener, &runtime, capability).await;
 
-    // A negotiated window admits the second sequence as a parallel assembly.
+    // A negotiated window admits parallel sequences on the shared channel.
     let hello = frame::encode(FrameType::Hello, 0, &[1]);
     let create = get_request(
         &listener,
@@ -319,68 +313,54 @@ async fn get_carrier_pending_bytes_bound_blocks_new_parts() {
     .await;
     let session = response_header(split_response(&create).0, "x-session-token").to_string();
 
-    let first = get_request(
-        &listener,
-        &runtime,
-        &format!(
-            "/api/v1/up?t={session}&n=2&s=1&u=0&d={}&p=0&pn=2",
-            b64(&head)
-        ),
-        "",
-    )
-    .await;
+    // Completing bodies must parse as frames: every retained part is a run
+    // of canonical Pong frames so the final operation applies cleanly.
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    let part: Vec<u8> = pong.iter().copied().cycle().take(5000).collect();
+    let open = |nonce: u64, sequence: u64, total: u32| {
+        format!(
+            "/api/v1/up?t={session}&n={nonce}&s={sequence}&u=0&d={}&p=0&pn={total}",
+            b64(&part)
+        )
+    };
+    // Sequence 1 stays pending while two pn=4096 fillers each commit the
+    // per-operation ceiling; a third non-head opening exceeds (W-1)*C.
+    let first = get_request(&listener, &runtime, &open(2, 1, 2), "").await;
     assert!(split_response(&first).0.starts_with(b"HTTP/1.1 204"));
-    // The second operation's part would exceed the session pending-byte bound.
-    let blocked = get_request(
-        &listener,
-        &runtime,
-        &format!(
-            "/api/v1/up?t={session}&n=3&s=2&u=0&d={}&p=0&pn=2",
-            b64(&head)
-        ),
-        "",
-    )
-    .await;
-    assert_decoy(&blocked);
-    // The rejection parked no record: a stray next part is still rejected.
-    let stray = get_request(
-        &listener,
-        &runtime,
-        &format!(
-            "/api/v1/up?t={session}&n=4&s=2&u=0&d={}&p=1&pn=2",
-            b64(&tail)
-        ),
-        "",
-    )
-    .await;
-    assert_decoy(&stray);
+    for (nonce, sequence) in [(3u64, 2u64), (4, 3)] {
+        let response = get_request(&listener, &runtime, &open(nonce, sequence, 4096), "").await;
+        assert!(split_response(&response).0.starts_with(b"HTTP/1.1 204"));
+    }
+    let blocked = get_request(&listener, &runtime, &open(5, 4, 4096), "").await;
+    assert!(
+        split_response(&blocked).0.starts_with(b"HTTP/1.1 503"),
+        "session cap exhaustion answers busy so the bridge retries"
+    );
+    // Busy parked no record: replaying an accepted filler part still works.
+    let replay = get_request(&listener, &runtime, &open(3, 2, 4096), "").await;
+    assert!(split_response(&replay).0.starts_with(b"HTTP/1.1 204"));
 
-    // Completing sequence 1 frees its pending bytes so sequence 2 proceeds.
+    // Completing sequence 1 applies it; its committed completed record is then
+    // evictable under pressure, which frees exactly the slot sequence 4 needs.
+    let tail = frame::encode(FrameType::Pong, 0, &[]);
     let finish = get_request(
         &listener,
         &runtime,
         &format!(
-            "/api/v1/up?t={session}&n=5&s=1&u=0&d={}&p=1&pn=2",
+            "/api/v1/up?t={session}&n=6&s=1&u=0&d={}&p=1&pn=2",
             b64(&tail)
         ),
         "",
     )
     .await;
-    assert_eq!(response_header(split_response(&finish).0, "x-up-ack"), "1");
-    for (nonce, part_index, chunk) in [(6u64, 0u32, head.clone()), (7, 1, tail.clone())] {
-        let response = get_request(
-            &listener,
-            &runtime,
-            &format!(
-                "/api/v1/up?t={session}&n={nonce}&s=2&u=0&d={}&p={part_index}&pn=2",
-                b64(&chunk)
-            ),
-            "",
-        )
-        .await;
-        let (headers, _) = split_response(&response);
-        assert!(headers.starts_with(b"HTTP/1.1 204"));
-    }
+    let finish_head = split_response(&finish).0;
+    assert!(finish_head.starts_with(b"HTTP/1.1 204"));
+    assert_eq!(response_header(finish_head, "x-up-ack"), "1");
+    let retried = get_request(&listener, &runtime, &open(7, 4, 4096), "").await;
+    assert!(
+        split_response(&retried).0.starts_with(b"HTTP/1.1 204"),
+        "the evicted committed record frees the retried opening"
+    );
 
     runtime.shutdown().await;
     generation.stop_sessions().await;
@@ -443,6 +423,7 @@ async fn get_carrier_close_clears_pending_fragments() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bootstrap = bootstrap(&listener, &runtime, capability).await;
     let session = get_session_token(&listener, &runtime, &bootstrap, 1).await;
+    let free_at_start = runtime.body_bytes_available();
 
     let pong = frame::encode(FrameType::Pong, 0, &[]);
     let head = &pong[..pong.len() / 2];
@@ -454,6 +435,10 @@ async fn get_carrier_close_clears_pending_fragments() {
     )
     .await;
     assert!(split_response(&part0).0.starts_with(b"HTTP/1.1 204"));
+    assert!(
+        runtime.body_bytes_available() < free_at_start,
+        "an open assembly holds its received bytes on the global budget"
+    );
     let close = get_request(
         &listener,
         &runtime,
@@ -462,6 +447,11 @@ async fn get_carrier_close_clears_pending_fragments() {
     )
     .await;
     assert!(close.starts_with(b"HTTP/1.1 204"));
+    assert_eq!(
+        runtime.body_bytes_available(),
+        free_at_start,
+        "closing the session releases every reassembly byte"
+    );
     // Late fragments on a closed session decoy instead of resurrecting state.
     let tail = &pong[pong.len() / 2..];
     let late = get_request(
@@ -472,6 +462,85 @@ async fn get_carrier_close_clears_pending_fragments() {
     )
     .await;
     assert_decoy(&late);
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn get_carrier_retired_replay_is_never_acknowledged_unverified() {
+    let capability = [29u8; 32];
+    let generation = test_runtime_generation(1, get_runtime_config(capability, WebCarrier::Https));
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = bootstrap(&listener, &runtime, capability).await;
+    let session = get_session_token(&listener, &runtime, &bootstrap, 1).await;
+
+    let pong = frame::encode(FrameType::Pong, 0, &[]);
+    let (head, tail) = pong.split_at(pong.len() / 2);
+    for (nonce, part, data) in [(2, 0, head), (3, 1, tail)] {
+        let response = get_request(
+            &listener,
+            &runtime,
+            &format!(
+                "/api/v1/up?t={session}&n={nonce}&s=1&d={}&p={part}&pn=2",
+                b64(data)
+            ),
+            "",
+        )
+        .await;
+        assert!(split_response(&response).0.starts_with(b"HTTP/1.1 204"));
+    }
+    // Opening the next sequence retires the completed record of sequence 1.
+    let next = get_request(
+        &listener,
+        &runtime,
+        &format!("/api/v1/up?t={session}&n=4&s=2&d={}&p=0&pn=2", b64(head)),
+        "",
+    )
+    .await;
+    assert!(split_response(&next).0.starts_with(b"HTTP/1.1 204"));
+
+    // A late final part of the retired sequence cannot be verified against
+    // the applied body, so it is stale (409) rather than acknowledged; with
+    // other bytes it must not be acknowledged either.
+    for (nonce, data) in [(5, tail), (6, head)] {
+        let replay = get_request(
+            &listener,
+            &runtime,
+            &format!(
+                "/api/v1/up?t={session}&n={nonce}&s=1&d={}&p=1&pn=2",
+                b64(data)
+            ),
+            "",
+        )
+        .await;
+        let replay_headers = split_response(&replay).0;
+        assert!(replay_headers.starts_with(b"HTTP/1.1 409"));
+        assert!(!has_header(replay_headers, "x-up-ack"));
+    }
+    // A late non-final part cannot reopen the sequence while the next one
+    // holds the only legacy record slot.
+    let part_replay = get_request(
+        &listener,
+        &runtime,
+        &format!("/api/v1/up?t={session}&n=7&s=1&d={}&p=0&pn=2", b64(head)),
+        "",
+    )
+    .await;
+    assert!(!has_header(split_response(&part_replay).0, "x-up-ack"));
+    assert!(!has_header(split_response(&part_replay).0, "x-up-part"));
+
+    // The open sequence still completes normally afterwards.
+    let last = get_request(
+        &listener,
+        &runtime,
+        &format!("/api/v1/up?t={session}&n=8&s=2&d={}&p=1&pn=2", b64(tail)),
+        "",
+    )
+    .await;
+    assert_eq!(response_header(split_response(&last).0, "x-up-ack"), "2");
 
     runtime.shutdown().await;
     generation.stop_sessions().await;
