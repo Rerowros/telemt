@@ -183,6 +183,13 @@ impl WebProcessRuntime {
             .and_then(|index| state.sessions.get(&index.session_hash))
             .map(|session| session.carrier_method())
             .unwrap_or_else(|| config.web.effective_carrier_method(&profile.host));
+        // The header payload budget follows the same lineage rule: the page
+        // keeps the budget it was rendered with across recovery.
+        let get_header_bytes = predecessor_session_id
+            .and_then(|session_id| state.session_index.get(&session_id))
+            .and_then(|index| state.sessions.get(&index.session_hash))
+            .map(|session| session.get_header_bytes())
+            .unwrap_or_else(|| config.web.effective_get_header_bytes(&profile.host));
         let issued_profile = Arc::clone(&profile);
         state.bootstraps.insert(
             hash,
@@ -203,6 +210,7 @@ impl WebProcessRuntime {
                 session: None,
                 carrier_request: None,
                 carrier_method,
+                get_header_bytes,
                 carrier_candidates: Arc::from([]),
                 carrier_scores: [0; 4],
                 carrier_attempt: 0,

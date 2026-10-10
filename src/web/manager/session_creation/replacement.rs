@@ -106,6 +106,7 @@ impl WebProcessRuntime {
         );
         session.configure_conveyor(replacement.old_session.conveyor_offer());
         session.configure_carrier_method(replacement.old_session.carrier_method());
+        session.configure_get_header_bytes(replacement.old_session.get_header_bytes());
         let Some(supersede) = replacement.old_session.prepare_carrier_supersede() else {
             drop(user_publication);
             drop(state);

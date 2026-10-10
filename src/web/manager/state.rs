@@ -69,6 +69,8 @@ pub(super) struct Bootstrap {
     pub(super) carrier_request: Option<CarrierRequest>,
     /// HTTPS carrier method frozen at issuance for this credential lineage.
     pub(super) carrier_method: crate::config::WebCarrierMethod,
+    /// GET uplink header payload budget frozen with the carrier method.
+    pub(super) get_header_bytes: usize,
     /// Learning-ranked carrier order frozen by the first automatic attempt.
     pub(super) carrier_candidates: Arc<[WebCarrier]>,
     /// Weighted learning scores captured when the candidate order was frozen.

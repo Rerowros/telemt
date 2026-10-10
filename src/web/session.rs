@@ -168,6 +168,8 @@ impl CarrierLane {
 struct SessionState {
     conveyor: conveyor::ConveyorState,
     carrier_method: crate::config::WebCarrierMethod,
+    /// GET uplink header payload budget frozen with the carrier method.
+    get_header_bytes: usize,
     get_fragments: get_fragments::GetFragments,
     streams: HashMap<u32, StreamState>,
     closing_streams: HashMap<u32, u64>,
@@ -306,6 +308,7 @@ impl WebSession {
             state: Mutex::new(SessionState {
                 conveyor: conveyor::ConveyorState::default(),
                 carrier_method: crate::config::WebCarrierMethod::default(),
+                get_header_bytes: 0,
                 get_fragments: get_fragments::GetFragments::default(),
                 streams: HashMap::new(),
                 closing_streams: HashMap::new(),

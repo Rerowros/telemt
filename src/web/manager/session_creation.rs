@@ -221,6 +221,7 @@ impl WebProcessRuntime {
         let issued_timeouts = entry.timeouts.clone();
         let recovery = entry.recovery;
         let carrier_method = entry.carrier_method;
+        let get_header_bytes = entry.get_header_bytes;
         let profile = config
             .web
             .runtime
@@ -365,6 +366,7 @@ impl WebProcessRuntime {
             1
         });
         session.configure_carrier_method(carrier_method);
+        session.configure_get_header_bytes(get_header_bytes);
         state.sessions.insert(session_hash, Arc::clone(&session));
         *state.sessions_per_ip.entry(client_ip).or_insert(0) += 1;
         *state.sessions_per_profile.entry(profile_key).or_insert(0) += 1;

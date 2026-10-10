@@ -187,6 +187,17 @@ impl WebSession {
         self.state.lock().carrier_method
     }
 
+    /// Freezes the GET uplink header payload budget the issuing page owns.
+    pub(crate) fn configure_get_header_bytes(&self, bytes: usize) {
+        self.state.lock().get_header_bytes = bytes;
+    }
+
+    /// Returns the GET uplink header payload budget frozen at creation;
+    /// zero means header payload is never accepted for this session.
+    pub(crate) fn get_header_bytes(&self) -> usize {
+        self.state.lock().get_header_bytes
+    }
+
     /// Returns the HTTP window without changing carrier capability negotiation.
     pub(crate) fn up_window(&self) -> u8 {
         if self.carrier().uses_websocket() {
