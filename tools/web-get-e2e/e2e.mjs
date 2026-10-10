@@ -69,8 +69,13 @@ function headerViolations(api) {
     out.push("header mode on but no header-carrying request");
   if (HEADER_MODE === "on" && refused.length)
     out.push(`${refused.length} header-carrying requests refused by the edge`);
-  if (HEADER_MODE === "fallback" && !refused.length)
-    out.push("fallback edge never refused a header-carrying request");
+  // A stock edge refuses payload heads with a 400 on HTTP/1.1 and resets
+  // the stream on h2; either way none of them may be answered.
+  const passed = carrying.filter((e) => e.status >= 200 && e.status < 300);
+  if (HEADER_MODE === "fallback" && !carrying.length)
+    out.push("fallback run never tried header payload");
+  if (HEADER_MODE === "fallback" && passed.length)
+    out.push(`fallback edge passed ${passed.length} header-carrying requests`);
   if (HEADER_MODE === "fallback" && carrying.length > HEADER_FALLBACK_MAX)
     out.push(`${carrying.length} header-carrying requests: downgrade loops`);
   return {
@@ -79,6 +84,12 @@ function headerViolations(api) {
       mode: HEADER_MODE,
       carrying: carrying.length,
       refused: refused.length,
+      unanswered: carrying.filter((e) => !e.status).length,
+      // Transport errors of header-carrying requests by Chromium error text.
+      failures: carrying.reduce((acc, e) => {
+        if (e.failure) acc[e.failure] = (acc[e.failure] || 0) + 1;
+        return acc;
+      }, {}),
       maxChars: Math.max(0, ...carrying.map((e) => e.headerChars)),
     },
   };
@@ -433,6 +444,11 @@ async function bench(method, rttMs, edge, label) {
     page.on("response", (res) => {
       const entry = entries.get(res.request());
       if (entry) entry.status = res.status();
+    });
+    page.on("requestfailed", (req) => {
+      const entry = entries.get(req);
+      if (entry && !entry.status)
+        entry.failure = req.failure()?.errorText || "?";
     });
 
     await page.goto(
