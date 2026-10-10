@@ -74,8 +74,10 @@ pub(crate) use websocket::{WebSocketConnection, WebSocketKind};
 const TOKEN_BYTES: usize = 32;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const TOKEN_NONCE_BYTES: usize = 16;
-const BOOTSTRAP_TOKEN_CONTEXT: &[u8] = b"telemt-web-bootstrap-token-v1\0";
-const SESSION_TOKEN_CONTEXT: &[u8] = b"telemt-web-session-token-v1\0";
+/// Context of the one keyed hash per token nonce: its first half is the
+/// bootstrap tag, its second half the session tag. Tokens live only as long
+/// as the random process key, so the layout carries no version promise.
+const TOKEN_CONTEXT: &[u8] = b"telemt-web-token-v2\0";
 
 /// Distinguishes process-authenticated WEB credential domains.
 #[derive(Clone, Copy)]
@@ -85,41 +87,48 @@ enum TokenKind {
 }
 
 struct TokenAuthenticator {
-    key: Zeroizing<[u8; 32]>,
+    /// HMAC already keyed with the random process key and primed with
+    /// `TOKEN_CONTEXT`; a clone skips the key schedule on every tag.
+    prepared: Hmac<Sha256>,
 }
 
 impl TokenAuthenticator {
     fn new(rng: &SecureRandom) -> Self {
         let mut key = Zeroizing::new([0; 32]);
         rng.fill(key.as_mut());
-        Self { key }
+        Self::from_key(&key)
+    }
+
+    fn from_key(key: &[u8; 32]) -> Self {
+        let mut prepared =
+            Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts every WEB token key length");
+        prepared.update(TOKEN_CONTEXT);
+        Self { prepared }
     }
 
     fn issue(&self, kind: TokenKind, nonce: [u8; TOKEN_NONCE_BYTES]) -> [u8; TOKEN_BYTES] {
         let mut token = [0; TOKEN_BYTES];
         token[..TOKEN_NONCE_BYTES].copy_from_slice(&nonce);
-        let tag = self.tag(kind, &nonce);
-        token[TOKEN_NONCE_BYTES..].copy_from_slice(&tag[..TOKEN_NONCE_BYTES]);
+        let tags = self.tags(&nonce);
+        let tag = match kind {
+            TokenKind::Bootstrap => &tags[..TOKEN_NONCE_BYTES],
+            TokenKind::Session => &tags[TOKEN_NONCE_BYTES..],
+        };
+        token[TOKEN_NONCE_BYTES..].copy_from_slice(tag);
         token
     }
 
+    /// Checks both token domains with one keyed hash: the pre-routing
+    /// credential scan runs this for every canonical 43-character window.
     fn authentic(&self, token: &[u8; TOKEN_BYTES]) -> bool {
         let nonce = &token[..TOKEN_NONCE_BYTES];
         let tag = &token[TOKEN_NONCE_BYTES..];
-        let bootstrap = self.tag(TokenKind::Bootstrap, nonce);
-        let session = self.tag(TokenKind::Session, nonce);
-        bool::from(
-            bootstrap[..TOKEN_NONCE_BYTES].ct_eq(tag) | session[..TOKEN_NONCE_BYTES].ct_eq(tag),
-        )
+        let tags = self.tags(nonce);
+        bool::from(tags[..TOKEN_NONCE_BYTES].ct_eq(tag) | tags[TOKEN_NONCE_BYTES..].ct_eq(tag))
     }
 
-    fn tag(&self, kind: TokenKind, nonce: &[u8]) -> [u8; 32] {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_ref())
-            .expect("HMAC accepts every WEB token key length");
-        mac.update(match kind {
-            TokenKind::Bootstrap => BOOTSTRAP_TOKEN_CONTEXT,
-            TokenKind::Session => SESSION_TOKEN_CONTEXT,
-        });
+    fn tags(&self, nonce: &[u8]) -> [u8; 32] {
+        let mut mac = self.prepared.clone();
         mac.update(nonce);
         mac.finalize().into_bytes().into()
     }
