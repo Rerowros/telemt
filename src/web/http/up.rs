@@ -40,8 +40,11 @@ pub(super) async fn handle_up(
     if let Some(parts) = request.extensions_mut().remove::<get::GetUpParts>() {
         // Header payload is accepted only up to the budget the issuing page
         // was rendered with; a session without one keeps URL-only grammar.
+        // The token is authentic here, so the session learns the reason:
+        // 431 makes the page fall back to URL-only instead of recovering
+        // into the same refusal.
         if parts.header_chars > session.get_header_bytes() {
-            return serve_decoy(request, vhost, true, &runtime).await;
+            return carrier_empty(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
         }
         return handle_get_up(
             request,

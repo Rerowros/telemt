@@ -59,6 +59,16 @@ fn indexed(lines: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// An authenticated session over its frozen header budget is told so with
+/// 431, which makes the page fall back to URL-only fragments.
+fn assert_header_refused(response: &[u8]) {
+    assert!(
+        response.starts_with(b"HTTP/1.1 431"),
+        "got {}",
+        String::from_utf8_lossy(status(response))
+    );
+}
+
 fn status(response: &[u8]) -> &[u8] {
     &response[..response.len().min(12)]
 }
@@ -250,7 +260,7 @@ async fn get_header_payload_is_capped_by_the_frozen_budget() {
         &header_lines(&indexed(&lines)),
     )
     .await;
-    assert_decoy(&response);
+    assert_header_refused(&response);
 
     // Exactly at the budget the same sequence applies.
     let fits = open_data_body(1, 9000);
@@ -292,7 +302,7 @@ async fn get_header_payload_is_not_accepted_when_the_feature_is_off() {
         &format!("X-Up-Data-0: {tail}\r\n"),
     )
     .await;
-    assert_decoy(&response);
+    assert_header_refused(&response);
     // Even a header that would not change the payload is refused.
     let response = get_request(
         &listener,
@@ -301,7 +311,7 @@ async fn get_header_payload_is_not_accepted_when_the_feature_is_off() {
         "X-Up-Data-0: AAAA\r\n",
     )
     .await;
-    assert_decoy(&response);
+    assert_header_refused(&response);
     // The URL-only form of the same sequence still applies.
     let response = get_request(
         &listener,
@@ -544,12 +554,17 @@ async fn get_header_budget_is_frozen_per_page_across_reload() {
             &header_lines(&indexed(&lines)),
         )
         .await;
-        assert_eq!(
-            response.starts_with(b"HTTP/1.1 204"),
-            accepted,
-            "got {}",
-            String::from_utf8_lossy(status(&response))
-        );
+        if accepted {
+            assert!(
+                response.starts_with(b"HTTP/1.1 204"),
+                "got {}",
+                String::from_utf8_lossy(status(&response))
+            );
+        } else {
+            // A session created after the reload (no surviving predecessor)
+            // is refused with 431 so its page falls back to URL-only.
+            assert_header_refused(&response);
+        }
     }
 
     runtime.shutdown().await;
