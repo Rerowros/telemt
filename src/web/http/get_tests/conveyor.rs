@@ -114,11 +114,24 @@ async fn get_carrier_bounds_conveyor_floor_window_and_confirmation() {
     )
     .await;
     assert_eq!(response_header(split_response(&valid).0, "x-up-ack"), "1");
-    // After commit, the same sequence cannot open a new assembly.
-    let stale = get_request(
+    // After commit, the same sequence re-sliced into more parts reassembles
+    // as a replay: its parts park unacknowledged until the digest verifies.
+    let resliced = get_request(
         &listener,
         &runtime,
         &format!("/api/v1/up?t={session}&n=5&s=1&u=0&d={pong}&p=0&pn=3"),
+        "",
+    )
+    .await;
+    let (resliced_headers, _) = split_response(&resliced);
+    assert!(resliced_headers.starts_with(b"HTTP/1.1 204"));
+    assert_eq!(response_header(resliced_headers, "x-up-part"), "0");
+    assert!(!has_header(resliced_headers, "x-up-ack"));
+    // A layout with fewer parts than the replay in progress still decoys.
+    let stale = get_request(
+        &listener,
+        &runtime,
+        &format!("/api/v1/up?t={session}&n=6&s=1&u=0&d={pong}&p=0&pn=2"),
         "",
     )
     .await;

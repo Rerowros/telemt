@@ -47,11 +47,13 @@ async fn get_carrier_reassembles_ordered_parts_and_replays_final() {
     .await;
     assert_decoy(&changed);
 
-    // Out-of-order part numbers cannot skip ahead of the assembly.
+    // A layout with fewer parts (a late part of an abandoned layout) decoys
+    // without disturbing the assembly; only a URL-only re-slice, which has
+    // more parts, supersedes it.
     let skipped = get_request(
         &listener,
         &runtime,
-        &format!("/api/v1/up?t={session}&n=5&s=1&d={}&p=1&pn=3", b64(tail)),
+        &format!("/api/v1/up?t={session}&n=5&s=1&d={}&p=0&pn=1", b64(tail)),
         "",
     )
     .await;
@@ -246,8 +248,8 @@ async fn get_carrier_completed_replay_rejects_changed_parts() {
             "/api/v1/up?t={session}&n=11&s=1&d={}&p=0&pn=2",
             b64(&tampered[..mid])
         ),
-        // Changed part count.
-        format!("/api/v1/up?t={session}&n=12&s=1&d={}&p=1&pn=3", b64(tail)),
+        // Fewer parts than the retained layout.
+        format!("/api/v1/up?t={session}&n=12&s=1&d={}&p=0&pn=1", b64(tail)),
         // Changed part length.
         format!("/api/v1/up?t={session}&n=13&s=1&d={}&p=1&pn=2", b64(&pong)),
     ] {
