@@ -29,15 +29,29 @@ pub(super) fn validate_vhosts(config: &mut ProxyConfig) -> Result<()> {
             ));
         }
         validate_decoy(vhost_idx, &vhost.decoy)?;
-        if vhost
+        let get_host = vhost
             .carrier_method
             .unwrap_or(config.web.carrier_method)
-            .is_get()
-        {
+            .is_get();
+        if get_host {
             get_carrier_hosts = true;
             if !crate::config::get_url_host_fits(&vhost.host, &vhost.base_path, limits) {
                 return config_error(&format!(
                     "web.vhosts[{vhost_idx}] host/base_path leaves no room for GET carrier data within web.limits.get_url_bytes"
+                ));
+            }
+        }
+        if let Some(bytes) = vhost.get_header_bytes {
+            // Header payload only exists on the GET carrier; a non-zero
+            // override on a POST host is a configuration mistake.
+            if bytes != 0 && !get_host {
+                return config_error(&format!(
+                    "web.vhosts[{vhost_idx}].get_header_bytes requires an effective carrier_method = \"get\""
+                ));
+            }
+            if !crate::config::get_header_fits(bytes, limits) {
+                return config_error(&format!(
+                    "web.vhosts[{vhost_idx}].get_header_bytes must be 0 or within [1024, 53760], and get_url_bytes + get_header_bytes + 32 per 7680-byte header line + 4096 bytes for other headers must fit web.limits.max_header_bytes (raise it up to 65536)"
                 ));
             }
         }

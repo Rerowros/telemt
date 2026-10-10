@@ -18,6 +18,7 @@
 //! | `access`  | All user/quota fields          | Effective immediately                          |
 //! | `web`     | Carrier, timing, and debug policy | Applied to newly issued sessions             |
 //! | `web`     | `carrier_method`               | Applied to newly rendered bridge pages        |
+//! | `web`     | `vhosts[].get_header_bytes`    | Applied to newly rendered bridge pages        |
 //! Fields that require re-binding sockets (`server.listeners`, legacy
 //! `server.port`, `censorship.*`, `network.*`, `use_middle_proxy`) are **not**
 //! applied; a warning is emitted. SYN limiter rules are process-owned and are

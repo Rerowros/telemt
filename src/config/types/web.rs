@@ -84,6 +84,10 @@ pub struct WebVhostConfig {
     /// Optional HTTPS carrier method override for this hostname.
     #[serde(default)]
     pub carrier_method: Option<WebCarrierMethod>,
+    /// Optional GET uplink header payload override for this hostname; `0`
+    /// disables header payload even when the global limit enables it.
+    #[serde(default)]
+    pub get_header_bytes: Option<usize>,
     /// Stable public destination tuple used by inner relay routing and KDF metadata.
     pub public_addr: SocketAddr,
     /// Ordinary-site fallback for this hostname.
@@ -110,6 +114,10 @@ pub struct WebLimitsConfig {
     /// per-page concurrency seed on multiplexed edges.
     #[serde(default = "default_web_get_parallel_parts")]
     pub get_parallel_parts: usize,
+    /// Base64url characters one GET uplink fragment may carry in request
+    /// headers on top of the URL `d` value; `0` keeps the URL-only carrier.
+    #[serde(default = "default_web_get_header_bytes")]
+    pub get_header_bytes: usize,
     /// Maximum payload carried by one WEB frame.
     #[serde(default = "default_web_max_frame_payload_bytes")]
     pub max_frame_payload_bytes: usize,
@@ -254,6 +262,7 @@ impl Default for WebLimitsConfig {
             max_body_bytes: default_web_max_body_bytes(),
             get_url_bytes: default_web_get_url_bytes(),
             get_parallel_parts: default_web_get_parallel_parts(),
+            get_header_bytes: default_web_get_header_bytes(),
             max_frame_payload_bytes: default_web_max_frame_payload_bytes(),
             carrier_batch_bytes: default_web_carrier_batch_bytes(),
             max_frames_per_body: default_web_max_frames_per_body(),
@@ -447,6 +456,43 @@ pub(crate) fn get_url_reserved_bytes(host: &str, base_path: &str) -> usize {
         + 2
 }
 
+/// Base64url characters carried by one GET uplink payload header line. One
+/// line plus its name stays inside a default nginx 8 KiB header buffer.
+pub(crate) const GET_HEADER_CHUNK_CHARS: usize = 7680;
+
+/// Maximum payload header lines (`x-up-data-0` ..) on one GET fragment.
+pub(crate) const GET_HEADER_MAX_LINES: usize = 7;
+
+/// Upper bound for `get_header_bytes` (52.5 KiB): below the ~56 KB of custom
+/// headers a GET-only CDN was measured to forward per request.
+pub(crate) const GET_HEADER_MAX_BYTES: usize = GET_HEADER_CHUNK_CHARS * GET_HEADER_MAX_LINES;
+
+/// Request-head bytes reserved for everything except the URL and the payload
+/// headers: Host, User-Agent, Accept*, mirrored carrier headers, and the
+/// forwarding headers an edge or CDN appends.
+pub(crate) const GET_HEADER_OTHER_BYTES: usize = 4096;
+
+/// Name, separator, and line-ending bytes charged per payload header line.
+pub(crate) const GET_HEADER_LINE_BYTES: usize = 32;
+
+/// Returns whether a GET header payload budget fits the restart-frozen
+/// request-head limit: URL budget, payload lines, and the other headers.
+pub(crate) fn get_header_fits(bytes: usize, limits: &WebLimitsConfig) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+    if !(1024..=GET_HEADER_MAX_BYTES).contains(&bytes) {
+        return false;
+    }
+    let lines = bytes.div_ceil(GET_HEADER_CHUNK_CHARS);
+    limits
+        .get_url_bytes
+        .saturating_add(bytes)
+        .saturating_add(lines.saturating_mul(GET_HEADER_LINE_BYTES))
+        .saturating_add(GET_HEADER_OTHER_BYTES)
+        <= limits.max_header_bytes
+}
+
 /// Returns whether one GET host fits the URL budget and can still send the
 /// configured carrier batch through at most [`GET_MAX_PARTS`] fragments.
 pub(crate) fn get_url_host_fits(host: &str, base_path: &str, limits: &WebLimitsConfig) -> bool {
@@ -540,6 +586,16 @@ impl WebConfig {
             .unwrap_or(self.carrier_method)
     }
 
+    /// Resolves the GET uplink header payload budget for one canonical host;
+    /// bridge pages and their credentials freeze the value at issuance.
+    pub(crate) fn effective_get_header_bytes(&self, host: &str) -> usize {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.vhosts.get(host))
+            .and_then(|vhost| vhost.get_header_bytes)
+            .unwrap_or(self.limits.get_header_bytes)
+    }
+
     /// Returns whether effective GET hosts fit the restart-only URL budget
     /// and never negotiate WebSocket candidates they cannot drive.
     pub(crate) fn get_carrier_fits_limits(&self) -> bool {
@@ -550,7 +606,14 @@ impl WebConfig {
                 continue;
             }
             any_get = true;
-            if !get_url_host_fits(&vhost.host, &vhost.base_path, &self.limits) {
+            if !get_url_host_fits(&vhost.host, &vhost.base_path, &self.limits)
+                || !get_header_fits(
+                    vhost
+                        .get_header_bytes
+                        .unwrap_or(self.limits.get_header_bytes),
+                    &self.limits,
+                )
+            {
                 return false;
             }
         }

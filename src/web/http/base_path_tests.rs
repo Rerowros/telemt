@@ -401,6 +401,7 @@ async fn prefixed_decoy_request_keeps_its_original_path_and_query() {
         host: "proxy.example.com".to_string(),
         base: "/relay/".to_string(),
         carrier_method: None,
+        get_header_bytes: None,
         decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
         decoy: WebRuntimeDecoy::HttpUpstream {
             addr: site_addr,

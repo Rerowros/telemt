@@ -125,6 +125,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                     format!("/{}/", vhost.base_path)
                 },
                 carrier_method: vhost.carrier_method,
+                get_header_bytes: vhost.get_header_bytes,
                 decoy_fasttrack_mode: config.web.decoy_fasttrack_mode,
                 decoy,
                 decoy_header_secs: config.web.timeouts.decoy_header_secs,

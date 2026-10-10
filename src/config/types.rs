@@ -52,8 +52,9 @@ pub use server::{
     WebClientIpSource,
 };
 pub(crate) use web::{
-    GET_MAX_PARTS, WebDecoyDnsSnapshot, WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile,
-    WebRuntimeVhost, WebStaticAsset, WebStaticSite, get_url_host_fits,
+    GET_HEADER_CHUNK_CHARS, GET_HEADER_MAX_LINES, GET_MAX_PARTS, WebDecoyDnsSnapshot,
+    WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost, WebStaticAsset,
+    WebStaticSite, get_header_fits, get_url_host_fits,
 };
 #[allow(unused_imports)]
 pub use web::{

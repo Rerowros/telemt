@@ -20,6 +20,8 @@ pub(crate) struct WebRuntimeVhost {
     pub(crate) base: String,
     /// Optional HTTPS carrier method override for this hostname.
     pub(crate) carrier_method: Option<crate::config::WebCarrierMethod>,
+    /// Optional GET uplink header payload override for this hostname.
+    pub(crate) get_header_bytes: Option<usize>,
     /// Restart-frozen decoy capability-scan policy.
     pub(crate) decoy_fasttrack_mode: WebDecoyFastTrackMode,
     /// Immutable ordinary-site fallback snapshot.

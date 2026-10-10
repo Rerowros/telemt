@@ -66,6 +66,7 @@ async fn every_authentic_credential_placement_stays_out_of_the_upstream() {
             host: "proxy.example.com".to_string(),
             base: "/relay/".to_string(),
             carrier_method: None,
+            get_header_bytes: None,
             decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
             decoy: WebRuntimeDecoy::HttpUpstream {
                 addr: site_addr,
@@ -82,6 +83,7 @@ async fn every_authentic_credential_placement_stays_out_of_the_upstream() {
             host: "other.example.com".to_string(),
             base: "/other/".to_string(),
             carrier_method: None,
+            get_header_bytes: None,
             decoy_fasttrack_mode: WebDecoyFastTrackMode::Off,
             decoy: WebRuntimeDecoy::HttpUpstream {
                 addr: site_addr,

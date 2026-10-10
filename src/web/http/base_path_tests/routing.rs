@@ -198,6 +198,7 @@ async fn decoy_forwarding_preserves_every_reference_request_target() {
             host: previous.host.clone(),
             base: previous.base.clone(),
             carrier_method: previous.carrier_method,
+            get_header_bytes: previous.get_header_bytes,
             decoy_fasttrack_mode: previous.decoy_fasttrack_mode,
             decoy: WebRuntimeDecoy::HttpUpstream {
                 addr: site_addr,
