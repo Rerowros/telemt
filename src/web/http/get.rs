@@ -64,6 +64,65 @@ pub(super) struct GetUpParts {
     pub(super) total: u32,
     /// Decoded payload bytes carried by this fragment.
     pub(super) data: Bytes,
+    /// Base64url characters this fragment carried in payload headers; the
+    /// session-frozen budget decides whether they are acceptable at all.
+    pub(super) header_chars: usize,
+}
+
+/// Name prefix of the indexed GET uplink payload headers (`x-up-data-0` ..).
+const HEADER_DATA_PREFIX: &str = "x-up-data-";
+
+/// Drops every GET payload header line so payload never reaches a decoy.
+pub(super) fn remove_payload_headers(headers: &mut hyper::HeaderMap) {
+    let names: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_payload_header(name))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
+/// Returns whether one header name belongs to the GET payload header family.
+fn is_payload_header(name: &HeaderName) -> bool {
+    name.as_str().starts_with(HEADER_DATA_PREFIX)
+}
+
+/// Collects the indexed payload headers in index order. Any family member
+/// with a non-canonical or out-of-range index, a repeated value, an empty or
+/// oversized line, or a gap in the index sequence rejects the request.
+/// Returns an empty list when the request carries no payload header.
+fn payload_headers(headers: &hyper::HeaderMap) -> Result<Vec<&[u8]>, ()> {
+    let mut lines: [Option<&[u8]>; crate::config::GET_HEADER_MAX_LINES] =
+        [None; crate::config::GET_HEADER_MAX_LINES];
+    let mut count = 0usize;
+    for name in headers.keys() {
+        let Some(index) = name.as_str().strip_prefix(HEADER_DATA_PREFIX) else {
+            continue;
+        };
+        let index = parse_decimal(index.as_bytes()).ok_or(())?;
+        let slot = usize::try_from(index)
+            .ok()
+            .and_then(|index| lines.get_mut(index))
+            .ok_or(())?;
+        let mut values = headers.get_all(name).iter();
+        let (Some(value), None) = (values.next(), values.next()) else {
+            return Err(());
+        };
+        let value = value.as_bytes();
+        if value.is_empty() || value.len() > crate::config::GET_HEADER_CHUNK_CHARS {
+            return Err(());
+        }
+        *slot = Some(value);
+        count += 1;
+    }
+    // Indexes must be exactly 0..count: a gap means a line was lost or
+    // reordered into a different request and the payload is not this one.
+    if lines[..count].iter().any(Option::is_none) {
+        return Err(());
+    }
+    Ok(lines[..count].iter().flatten().copied().collect())
 }
 
 /// Validated logical-operation coordinates shared by every fragment of one
@@ -232,6 +291,9 @@ pub(super) fn normalize(
             .map(|(_, value)| value.as_slice())
     };
     let has = |key: &str| value_of(key).is_some();
+    // Payload headers are parsed structurally before authentication so a
+    // malformed family member is rejected exactly like a malformed query.
+    let payload = payload_headers(request.headers())?;
     let operation = match route {
         Route::Session if has(KEY_OPERATION) => {
             if value_of(KEY_OPERATION) != Some(b"close") {
@@ -277,6 +339,11 @@ pub(super) fn normalize(
         return Err(());
     }
     if parse_decimal(value_of(KEY_NONCE).unwrap_or_default()).is_none_or(|nonce| nonce == 0) {
+        return Err(());
+    }
+    // Only uplink fragments carry header payload; every other route keeps
+    // its URL-only grammar.
+    if !payload.is_empty() && !matches!(operation, Operation::Up) {
         return Err(());
     }
     // Authenticate the host-bound token against the store matching this
@@ -364,8 +431,31 @@ pub(super) fn normalize(
             if total == 0 || total > crate::config::GET_MAX_PARTS || part >= total {
                 return Err(());
             }
-            let data = decode_data(value_of(KEY_DATA).unwrap_or_default(), data_limit).ok_or(())?;
-            parts_extension = Some(GetUpParts { part, total, data });
+            // The fragment payload is the URL `d` value followed by the
+            // payload header lines in index order, decoded as one string.
+            let query_data = value_of(KEY_DATA).unwrap_or_default();
+            let header_chars = payload.iter().map(|line| line.len()).sum::<usize>();
+            let data = if payload.is_empty() {
+                decode_data(query_data, data_limit)
+            } else {
+                let mut joined = Vec::with_capacity(query_data.len().saturating_add(header_chars));
+                joined.extend_from_slice(query_data);
+                for line in &payload {
+                    joined.extend_from_slice(line);
+                }
+                // `d` stays mandatory and non-empty in header mode too.
+                if query_data.is_empty() {
+                    return Err(());
+                }
+                decode_data(&joined, data_limit)
+            }
+            .ok_or(())?;
+            parts_extension = Some(GetUpParts {
+                part,
+                total,
+                data,
+                header_chars,
+            });
         }
         Operation::Create | Operation::Diagnostic => {
             let data = decode_data(value_of(KEY_DATA).unwrap_or_default(), data_limit).ok_or(())?;
@@ -442,6 +532,9 @@ pub(super) fn normalize(
     for (name, value) in prepared {
         request.headers_mut().insert(name, value);
     }
+    // The payload now lives in the fragment extension; the bulky lines never
+    // travel further, including into a later decoy response.
+    remove_payload_headers(request.headers_mut());
     if let Some(parts) = parts_extension {
         request.extensions_mut().insert(parts);
     }

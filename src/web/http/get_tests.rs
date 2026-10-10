@@ -6,6 +6,7 @@
 // - normalization: canonical query shape, credentials, and leak fences
 // - parallel: out-of-order non-final parts and fixed-chunk final gating
 // - commitment: window-scaled session caps, eviction, and POST isolation
+// - headers: indexed header payload joining, budget, and decoy fences
 
 use std::sync::Arc;
 
@@ -23,6 +24,8 @@ use crate::web::manager::WebProcessRuntime;
 mod commitment;
 #[path = "get_tests/conveyor.rs"]
 mod conveyor;
+#[path = "get_tests/headers.rs"]
+mod headers;
 #[path = "get_tests/normalization.rs"]
 mod normalization;
 #[path = "get_tests/parallel.rs"]

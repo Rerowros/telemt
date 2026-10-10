@@ -65,12 +65,18 @@ impl WebSession {
         total: u32,
         data: Bytes,
     ) -> Result<GetUpOffer, GetUpReject> {
+        // One fragment decodes from at most the URL budget plus the frozen
+        // header payload budget worth of base64url characters.
+        let fragment_limit = self
+            .limits
+            .get_url_bytes
+            .saturating_add(self.get_header_bytes());
         if sequence == 0
             || total == 0
             || total > GET_MAX_PARTS
             || part >= total
             || data.is_empty()
-            || data.len() > self.limits.get_url_bytes
+            || data.len() > fragment_limit
             || data.len() > self.limits.max_body_bytes
         {
             return Err(GetUpReject::Decoy);

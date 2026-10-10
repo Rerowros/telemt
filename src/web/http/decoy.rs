@@ -314,6 +314,7 @@ fn sanitize_transport_request<B>(request: &mut Request<B>) {
     ] {
         request.headers_mut().remove(name);
     }
+    super::get::remove_payload_headers(request.headers_mut());
     request
         .headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("close"));

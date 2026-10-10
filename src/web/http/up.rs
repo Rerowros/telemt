@@ -38,6 +38,11 @@ pub(super) async fn handle_up(
         None
     };
     if let Some(parts) = request.extensions_mut().remove::<get::GetUpParts>() {
+        // Header payload is accepted only up to the budget the issuing page
+        // was rendered with; a session without one keeps URL-only grammar.
+        if parts.header_chars > session.get_header_bytes() {
+            return serve_decoy(request, vhost, true, &runtime).await;
+        }
         return handle_get_up(
             request,
             runtime,
