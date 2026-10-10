@@ -9,10 +9,14 @@ use crate::web::manager::WebProcessRuntime;
 struct InternalCredential;
 
 /// Marks requests whose metadata contains a capability or process token.
+/// `uplink_route` skips the GET payload header lines: on the uplink route
+/// they are stripped before any decoy forwarding, and scanning tens of
+/// kilobytes of payload costs one HMAC pair per base64url position.
 pub(super) fn mark_internal_credential<B>(
     request: &mut Request<B>,
     config: &WebRuntimeConfig,
     runtime: &WebProcessRuntime,
+    uplink_route: bool,
 ) {
     let uri = request.uri();
     let uri_contains = uri
@@ -21,10 +25,14 @@ pub(super) fn mark_internal_credential<B>(
         || uri
             .path_and_query()
             .is_some_and(|path| contains_secret(path.as_str().as_bytes(), config, runtime));
-    let headers_contain = request.headers().iter().any(|(name, value)| {
-        contains_secret(name.as_str().as_bytes(), config, runtime)
-            || contains_secret(value.as_bytes(), config, runtime)
-    });
+    let headers_contain = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| !(uplink_route && super::get::is_payload_header(name)))
+        .any(|(name, value)| {
+            contains_secret(name.as_str().as_bytes(), config, runtime)
+                || contains_secret(value.as_bytes(), config, runtime)
+        });
     if uri_contains || headers_contain {
         request.extensions_mut().insert(InternalCredential);
     }

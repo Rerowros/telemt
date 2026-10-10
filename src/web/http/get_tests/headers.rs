@@ -558,3 +558,73 @@ async fn get_header_budget_is_frozen_per_page_across_reload() {
     reloaded.stop_sessions().await;
     reloaded.stop_background_tasks().await;
 }
+
+#[tokio::test]
+async fn get_payload_headers_skip_the_credential_scan_only_on_the_uplink_route() {
+    let capability = [80u8; 32];
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = header_runtime_config(capability, WebCarrier::Https, 40000);
+    let runtime_config = Arc::get_mut(config.web.runtime.as_mut().unwrap()).unwrap();
+    let vhost = Arc::get_mut(runtime_config.vhosts.get_mut(HOST).unwrap()).unwrap();
+    vhost.decoy = WebRuntimeDecoy::HttpUpstream {
+        addr: origin.local_addr().unwrap(),
+        authority: "decoy.example".to_string(),
+    };
+    let generation = test_runtime_generation(1, config);
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = bootstrap(&listener, &runtime, capability).await;
+    let session = get_session_token(&listener, &runtime, &bootstrap, 1).await;
+
+    // On the uplink route payload lines are not HMAC-scanned for
+    // credentials (a fragment would cost one HMAC pair per base64url
+    // position); they are stripped before the decoy forwards anything.
+    let target = format!("/api/v1/up?t={}&n=2&s=1&d=AAAA", "B".repeat(43));
+    let bytes = format!(
+        "GET {target} HTTP/1.1
+Host: {HOST}
+X-Forwarded-For: 192.0.2.10
+X-Up-Data-0: {session}
+Connection: close
+
+"
+    )
+    .into_bytes();
+    let (response, captured) = tokio::join!(request(&listener, &runtime, bytes), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), capture_upstream(&origin))
+            .await
+            .ok()
+    });
+    let captured = captured.expect("the sanitized probe reaches the decoy origin");
+    let forwarded = std::str::from_utf8(&captured).unwrap();
+    assert!(!forwarded.contains(&session));
+    assert!(!forwarded.to_lowercase().contains("x-up-data"));
+    assert!(response.ends_with(b"origin"));
+
+    // Any other route keeps the full fence: a credential in a payload-named
+    // header is answered locally and never forwarded.
+    let bytes = format!(
+        "GET /index.html HTTP/1.1
+Host: {HOST}
+X-Forwarded-For: 192.0.2.10
+X-Up-Data-0: {session}
+Connection: close
+
+"
+    )
+    .into_bytes();
+    let (response, captured) = tokio::join!(request(&listener, &runtime, bytes), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), capture_upstream(&origin))
+            .await
+            .ok()
+    });
+    assert!(
+        captured.is_none(),
+        "a fenced credential reached the decoy origin"
+    );
+    assert!(response.starts_with(b"HTTP/1.1 404"));
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}

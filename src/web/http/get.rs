@@ -85,7 +85,7 @@ pub(super) fn remove_payload_headers(headers: &mut hyper::HeaderMap) {
 }
 
 /// Returns whether one header name belongs to the GET payload header family.
-fn is_payload_header(name: &HeaderName) -> bool {
+pub(super) fn is_payload_header(name: &HeaderName) -> bool {
     name.as_str().starts_with(HEADER_DATA_PREFIX)
 }
 

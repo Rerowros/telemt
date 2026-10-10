@@ -192,7 +192,8 @@ async fn handle_request(
     let Some(vhost) = web_runtime.vhosts.get(host).cloned() else {
         return generic_not_found();
     };
-    secrets::mark_internal_credential(&mut request, web_runtime, &runtime);
+    let uplink_route = request.uri().path().strip_prefix(&vhost.base) == Some("api/v1/up");
+    secrets::mark_internal_credential(&mut request, web_runtime, &runtime, uplink_route);
     let suffix = request.uri().path().strip_prefix(&vhost.base);
     if suffix == Some(WEBSOCKET_SUFFIX) {
         return websocket::handle(
