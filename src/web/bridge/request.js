@@ -132,21 +132,23 @@ function create(settings){
  function retryableStatus(status){return status===408||status===429||status===502||status===503||status===504}
  // Page-wide health of GET header payload. Header mode is one-way: once an
  // edge shows it cannot pass the payload headers the page stays URL-only.
- // - a status that edges use for oversized request heads (400, 413, 431,
- //   nginx 494) on a header-carrying request downgrades at once;
- // - transport failures (network error or timeout) of header-carrying
- //   requests downgrade after two in a row with no header-carrying response
- //   in between, when either no header-carrying request was ever answered on
- //   this page or a URL-only request was answered after the first of them,
- //   so a plain network outage on a proven edge never disables the mode.
+ // - a status that edges use for oversized request heads (413, 431, nginx
+ //   494, and 400 until a header-carrying request was answered) on a
+ //   header-carrying request downgrades at once;
+ // - soft faults of header-carrying requests (network error, timeout, a 400
+ //   on a proven page) downgrade after two in a row with no header-carrying
+ //   response in between, when either no header-carrying request was ever
+ //   answered on this page or a URL-only request was answered 2xx after the
+ //   first of them, so neither a plain network outage nor a decoy answering
+ //   an expired session disables the mode on a proven edge.
  const headerHealth={off:false,proven:false,streak:0,streakAt:0,smallAt:0,clock:0};
  function headerLimitStatus(status){return status===400||status===413||status===431||status===494}
  function headerBudget(){return headerHealth.off||!settings.headerBytes?0:Math.max(0,Math.floor(settings.headerBytes())||0)}
  function headerAnswered(){headerHealth.proven=true;headerHealth.streak=0}
  function smallAnswered(){headerHealth.smallAt=++headerHealth.clock}
- function headerFault(transport){
+ function headerFault(soft){
   if(headerHealth.off)return;
-  if(!transport){headerHealth.off=true;return}
+  if(!soft){headerHealth.off=true;return}
   if(!headerHealth.streak)headerHealth.streakAt=++headerHealth.clock;
   headerHealth.streak++;
   if(headerHealth.streak>=2&&(!headerHealth.proven||headerHealth.smallAt>headerHealth.streakAt))headerHealth.off=true;
@@ -267,9 +269,9 @@ function create(settings){
      if(lines){
       // An edge refusing the request head never forwarded it, so the part
       // is replayed (URL-only after the downgrade) like a retry.
-      if(headerLimitStatus(fetched.status)){headerFault(false);settings.cancel(fetched);return{kind:'retry',reason:'http',wait:0,header:true}}
+      if(headerLimitStatus(fetched.status)){headerFault(fetched.status===400&&headerHealth.proven);settings.cancel(fetched);return{kind:'retry',reason:'http',wait:0,header:true}}
       headerAnswered();
-     }else smallAnswered();
+     }else if(fetched.status>=200&&fetched.status<300)smallAnswered();
      if(retryableStatus(fetched.status)){wait=retryAfterMs(fetched);settings.cancel(fetched);return{kind:'retry',reason:'http',wait}}
      const policy=responsePolicy(path,fetched.status);let payload;
      const partReceiver=part===total-1?receiver:(next,signal)=>settings.read(next,0,true,signal);
@@ -296,9 +298,10 @@ function create(settings){
      controller.abort();
      if(settings.closed()||(external&&external.aborted)||(opSignal&&opSignal.aborted))throw error;
      if(settings.reason(error,'')==='protocol')throw error;
-     // The server answers a non-final fragment at once, so only there a
-     // timeout is a transport fault; a final part may be legitimately held.
-     if(lines&&(!timedOut||(uplink&&total>1&&part<total-1)))headerFault(true);
+     // The server answers a non-final fragment at once, so there a timeout
+     // is a transport fault; a final part may be legitimately held, so its
+     // timeout counts only until a header-carrying request was answered.
+     if(lines&&(!timedOut||(uplink&&total>1&&part<total-1)||!headerHealth.proven))headerFault(true);
      if(timedOut)return{kind:'retry',reason:'timeout',wait:0,header:!!lines};
      return{kind:'retry',reason:'network',wait,header:!!lines};
     }finally{

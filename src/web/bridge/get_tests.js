@@ -1816,7 +1816,7 @@ test("a proven page keeps header mode through an outage until a URL-only answer"
   await flush();
 });
 
-test("a 400 after acknowledged parts keeps the operation layout", async () => {
+test("a 431 after acknowledged parts keeps the operation layout", async () => {
   const env = environment(renderedPage());
   const requestClient = headerClient(env, { retryMs: () => 5000 });
   const body = frame(2, 1, varied(100000, 11));
@@ -1828,7 +1828,7 @@ test("a 400 after acknowledged parts keeps the operation layout", async () => {
   await flush();
   const [part1] = live(env);
   assert.equal(params(part1.url).get("p"), "1");
-  env.answer(part1, 400, null, {});
+  env.answer(part1, 431, null, {});
   await flush();
   // The retry waits one short backoff, well inside the request deadline.
   await env.tick(400);
@@ -1847,6 +1847,105 @@ test("a 400 after acknowledged parts keeps the operation layout", async () => {
   const later = await ackAll(env, 8);
   assert.equal((await next).status, 204);
   assert.ok(later.every((r) => payloadLines(r).length === 0));
+  env.close();
+  await flush();
+});
+
+test("a proven page counts a 400 as a fault and needs a URL-only 2xx witness", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env);
+  const first = upload(requestClient, frame(2, 1, varied(30000, 6)), 7);
+  await flush();
+  await ackAll(env, 7);
+  assert.equal((await first).status, 204);
+  const poll = (status) => {
+    const sent = requestClient
+      .send(
+        "/api/v1/down",
+        requestClient.options(
+          "POST",
+          SESSION,
+          null,
+          { "X-Down-Cursor": "0" },
+          null,
+        ),
+        null,
+        1,
+        null,
+      )
+      .catch(() => null);
+    return flush().then(() => {
+      env.answer(env.pending("/api/v1/down")[0], status, null, {});
+      return sent;
+    });
+  };
+  // A session that expired meets the decoy: header-carrying requests may
+  // get its 400, URL-only ones its 404. Neither proves the edge refuses
+  // payload headers, so the proven page keeps header mode.
+  const body = frame(2, 1, varied(30000, 8));
+  for (let round = 0; round < 2; round++) {
+    let failure = null;
+    upload(requestClient, body, 8).catch((error) => {
+      failure = error;
+    });
+    await flush();
+    const [refused] = live(env);
+    assert.ok(
+      payloadLines(refused).length > 0,
+      "round " + round + " carries headers",
+    );
+    env.answer(refused, 400, null, {});
+    await flush();
+    assert.ok(failure, "the operation escalates to recovery as before");
+    await poll(404);
+  }
+  const replay = upload(requestClient, body, 8);
+  await flush();
+  const [again] = live(env);
+  assert.ok(payloadLines(again).length > 0, "decoy answers keep header mode");
+  // A URL-only request answered 2xx while header requests keep getting 400:
+  // the edge refuses the request heads, so the page downgrades and reslices.
+  await poll(204);
+  env.answer(again, 400, null, {});
+  await flush();
+  const parts = await ackAll(env, 8);
+  assert.equal((await replay).status, 204);
+  assert.ok(
+    parts.length > 1 && parts.every((r) => payloadLines(r).length === 0),
+  );
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
+  env.close();
+  await flush();
+});
+
+test("an unproven page downgrades after two held single-part header requests", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { retryMs: () => 5000 });
+  // 30 KB fits one header-carrying request: it is a single, final part.
+  const body = frame(2, 1, varied(30000, 5));
+  const operation = upload(requestClient, body, 7, 2);
+  await flush();
+  for (let i = 0; i < 2; i++) {
+    let [held] = live(env);
+    for (let step = 0; !held && step < 50; step++) {
+      await env.tick(100);
+      [held] = live(env);
+    }
+    assert.ok(held, "attempt " + i + " was sent");
+    assert.ok(
+      payloadLines(held).length > 0,
+      "attempt " + i + " carries headers",
+    );
+    assert.equal(params(held.url).get("pn"), null);
+    // An edge that swallows the big request head never answers it.
+    await env.tick(1000);
+    await flush();
+  }
+  const parts = await ackAll(env, 7);
+  assert.equal((await operation).status, 204);
+  assert.ok(parts.length > 1, "resliced into URL-only fragments");
+  assert.ok(parts.every((r) => payloadLines(r).length === 0));
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
   env.close();
   await flush();
 });
