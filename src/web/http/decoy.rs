@@ -32,7 +32,6 @@ where
     if super::secrets::has_internal_credential(&request) {
         return super::response::private_not_found();
     }
-    super::secrets::remove_unscanned_headers(&mut request);
     super::set_trace_route(&request, crate::web::trace::TraceRoute::Decoy);
     if sanitize_transport {
         sanitize_transport_request(&mut request);
