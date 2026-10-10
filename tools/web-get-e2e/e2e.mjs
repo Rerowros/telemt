@@ -2,6 +2,9 @@
 // real bridge page through MessageChannel init, HELLO, OPEN/DATA and a 1 MiB
 // bytewise roundtrip, measures one held 30 s downlink poll, and audits that
 // every carrier request is a GET without a body within the URL budget.
+// E2E_HEADER_MODE (set by run.sh): `off` (no payload headers allowed), `on`
+// (payload headers must be used and never refused), `fallback` (stock nginx
+// refuses them; the page must downgrade once and still pass every check).
 //
 // usage: node e2e.mjs <capability-b64> [carrier] [outDir]
 //        node e2e.mjs <capability-b64> <carrier> <outDir> bench <method> <rttMs> <edgeOrigin> <label>
@@ -28,6 +31,58 @@ const BIG_TOTAL = 12 * 1024 * 1024;
 const CHUNK = 256 * 1024;
 const LONG_POLL_MIN_MS = 29000;
 const LONG_POLL_MAX_MS = 45000;
+const HEADER_MODE = process.env.E2E_HEADER_MODE || "off";
+const HEADER_BYTES = Number(process.env.E2E_HEADER_BYTES || 0);
+const HEADER_LINE = 7680;
+// Header-carrying requests a page may issue before its downgrade settles:
+// at most the parallel parts in flight per operation across a few lanes.
+const HEADER_FALLBACK_MAX = 48;
+
+// Indexed GET payload header lines of one request (names lowercased).
+function payloadHeaders(req) {
+  const headers = req.headers();
+  const lines = Object.keys(headers)
+    .filter((name) => name.startsWith("x-up-data-"))
+    .map((name) => headers[name].length);
+  return {
+    lines: lines.length,
+    chars: lines.reduce((a, b) => a + b, 0),
+    maxLine: lines.length ? Math.max(...lines) : 0,
+  };
+}
+
+// Mode-specific header audit shared by the e2e and bench drivers.
+function headerViolations(api) {
+  const carrying = api.filter((e) => e.headerLines > 0);
+  const refused = carrying.filter((e) => e.status === 400 || e.status === 431);
+  const out = [];
+  for (const e of carrying) {
+    if (e.headerMaxLine > HEADER_LINE)
+      out.push(`header line ${e.headerMaxLine} > ${HEADER_LINE}`);
+    if (e.headerChars > HEADER_BYTES)
+      out.push(`header payload ${e.headerChars} > ${HEADER_BYTES}`);
+    if (!e.path.endsWith("/api/v1/up")) out.push(`header payload on ${e.path}`);
+  }
+  if (HEADER_MODE === "off" && carrying.length)
+    out.push(`${carrying.length} header-carrying requests with header mode off`);
+  if (HEADER_MODE === "on" && !carrying.length)
+    out.push("header mode on but no header-carrying request");
+  if (HEADER_MODE === "on" && refused.length)
+    out.push(`${refused.length} header-carrying requests refused by the edge`);
+  if (HEADER_MODE === "fallback" && !refused.length)
+    out.push("fallback edge never refused a header-carrying request");
+  if (HEADER_MODE === "fallback" && carrying.length > HEADER_FALLBACK_MAX)
+    out.push(`${carrying.length} header-carrying requests: downgrade loops`);
+  return {
+    out,
+    stats: {
+      mode: HEADER_MODE,
+      carrying: carrying.length,
+      refused: refused.length,
+      maxChars: Math.max(0, ...carrying.map((e) => e.headerChars)),
+    },
+  };
+}
 
 const results = {
   carrier,
@@ -73,9 +128,11 @@ async function main() {
   results.probes.put = await edgeProbe("PUT", "/api/v1/up");
   results.probes.delete = await edgeProbe("DELETE", "/api/v1/session");
   results.probes.head = await edgeProbe("HEAD", "/");
-  results.probes.long_uri = await edgeProbe("GET", "/?" + "x".repeat(9000));
+  // Longer than one 16k edge buffer: the request line cannot fit (414).
+  results.probes.long_uri = await edgeProbe("GET", "/?" + "x".repeat(17000));
+  // Longer than one 16k edge header buffer (and the stock 8k one).
   results.probes.big_header = await edgeProbe("GET", "/", {
-    "X-Big": "a".repeat(9000),
+    "X-Big": "a".repeat(17000),
   });
 
   const browser = await chromium.launch({
@@ -100,9 +157,11 @@ async function main() {
     // replies carry no body), which Chromium reports as ERR_ABORTED even
     // though the request reached the server and was answered. A failure only
     // counts when no response was received at all.
+    const entries = new Map();
     const settle = (req, finished) =>
       settlements.push(
         (async () => {
+          const entry = entries.get(req);
           const url = new URL(req.url());
           if (url.hostname !== "proxy.example.com") return;
           const started = pending.get(req);
@@ -114,7 +173,17 @@ async function main() {
               status: response.status(),
             });
           }
-          if (!finished && !response && Date.now() < closingAt) {
+          if (entry) entry.status = response ? response.status() : null;
+          // In fallback mode the downgrade cancels the sibling parts that
+          // were already in flight with payload headers.
+          const expectedAbort =
+            HEADER_MODE === "fallback" && entry && entry.headerLines > 0;
+          if (
+            !finished &&
+            !response &&
+            Date.now() < closingAt &&
+            !expectedAbort
+          ) {
             failures.push({
               path: url.pathname,
               reason: req.failure()?.errorText || "?",
@@ -125,6 +194,7 @@ async function main() {
     page.on("request", (req) => {
       const url = new URL(req.url());
       if (url.hostname !== "proxy.example.com") return;
+      const payload = payloadHeaders(req);
       const entry = {
         method: req.method(),
         path: url.pathname,
@@ -133,8 +203,13 @@ async function main() {
         create:
           url.pathname.endsWith("/api/v1/session") &&
           url.searchParams.get("op") !== "close",
+        headerLines: payload.lines,
+        headerChars: payload.chars,
+        headerMaxLine: payload.maxLine,
+        status: undefined,
       };
       audit.push(entry);
+      entries.set(req, entry);
       pending.set(req, Date.now());
     });
     page.on("requestfinished", (req) => settle(req, true));
@@ -239,6 +314,11 @@ async function main() {
         );
       }
     }
+    const headerAudit = headerViolations(
+      audit.filter((e) => e.path.includes("/api/")),
+    );
+    results.audit.violations.push(...headerAudit.out);
+    results.audit.headers = headerAudit.stats;
     results.audit.requests = audit.length;
     results.audit.apiRequests = audit.filter((e) =>
       e.path.includes("/api/"),
@@ -281,6 +361,7 @@ async function main() {
     `requests=${results.audit.requests} api=${results.audit.apiRequests} longPollMs=${results.longPollMs}`,
   );
   console.log(`roundtrip=${results.roundtrip}`);
+  console.log(`headers=${JSON.stringify(results.audit.headers)}`);
 }
 
 function percentiles(times) {
@@ -331,15 +412,27 @@ async function bench(method, rttMs, edge, label) {
       consoleLog.write(`[${msg.type()}] ${msg.text()}\n`),
     );
     const audit = [];
+    const entries = new Map();
     page.on("request", (req) => {
       const url = new URL(req.url());
       if (url.hostname !== "proxy.example.com") return;
-      audit.push({
+      const payload = payloadHeaders(req);
+      const entry = {
         method: req.method(),
         path: url.pathname,
         urlBytes: req.url().length,
         body: req.postData() !== null,
-      });
+        headerLines: payload.lines,
+        headerChars: payload.chars,
+        headerMaxLine: payload.maxLine,
+        status: undefined,
+      };
+      audit.push(entry);
+      entries.set(req, entry);
+    });
+    page.on("response", (res) => {
+      const entry = entries.get(res.request());
+      if (entry) entry.status = res.status();
     });
 
     await page.goto(
@@ -416,20 +509,24 @@ async function bench(method, rttMs, edge, label) {
       load: load.map((ms) => Math.round(ms)),
     };
     const api = audit.filter((e) => e.path.includes("/api/"));
+    const headerAudit = headerViolations(api);
     result.audit = {
       requests: audit.length,
       apiRequests: api.length,
+      headers: headerAudit.stats,
       violations:
         method === "get"
-          ? api.flatMap((e) =>
-              [
-                e.method !== "GET" ? `non-GET ${e.method} ${e.path}` : null,
-                e.body ? `body on ${e.path}` : null,
-                e.urlBytes > URL_BUDGET
-                  ? `url ${e.urlBytes}B > ${URL_BUDGET} on ${e.path}`
-                  : null,
-              ].filter(Boolean),
-            )
+          ? api
+              .flatMap((e) =>
+                [
+                  e.method !== "GET" ? `non-GET ${e.method} ${e.path}` : null,
+                  e.body ? `body on ${e.path}` : null,
+                  e.urlBytes > URL_BUDGET
+                    ? `url ${e.urlBytes}B > ${URL_BUDGET} on ${e.path}`
+                    : null,
+                ].filter(Boolean),
+              )
+              .concat(headerAudit.out)
           : [],
     };
     result.ok =

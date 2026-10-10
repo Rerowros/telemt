@@ -20,7 +20,9 @@ use crate::web::manager::WebProcessRuntime;
 /// Runs the GET-carrier fixture endpoint until the fixture TTL elapses.
 /// TELEMT_WEB_GET_E2E_ECHO=1 additionally switches the session backend to the
 /// marker-dispatched fixture loop so the browser roundtrip does not need a DC
-/// upstream; TELEMT_WEB_E2E_METHOD=post selects the canonical body carrier.
+/// upstream; TELEMT_WEB_E2E_METHOD=post selects the canonical body carrier and
+/// TELEMT_WEB_E2E_GET_HEADER_BYTES enables GET header payload with 64 KiB
+/// request heads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "fixture for tools/web-get-e2e; run via run.sh"]
 async fn get_carrier_browser_fixture() {
@@ -49,13 +51,27 @@ async fn get_carrier_browser_fixture() {
         Ok("post") => WebCarrierMethod::Post,
         _ => WebCarrierMethod::Get,
     };
+    let header_bytes: usize = std::env::var("TELEMT_WEB_E2E_GET_HEADER_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if header_bytes > 0 {
+        config.web.limits.max_header_bytes = 65536;
+        config.web.limits.get_header_bytes = header_bytes;
+        assert!(crate::config::get_header_fits(
+            header_bytes,
+            &config.web.limits
+        ));
+    }
     config.web.timeouts.long_poll_secs = 30;
     config.web.limits.max_bootstraps_per_ip = 64;
     let generation = test_runtime_generation(1, config);
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
     let listener = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(capability);
-    eprintln!("E2E_READY port={port} carrier={carrier:?} capability={encoded}");
+    eprintln!(
+        "E2E_READY port={port} carrier={carrier:?} header_bytes={header_bytes} capability={encoded}"
+    );
 
     let cancel = CancellationToken::new();
     let server = {

@@ -8,6 +8,9 @@
 # the fixture self-terminates after TELEMT_WEB_E2E_TTL_SECS (default 600).
 # TELEMT_E2E_BIN may point at a prebuilt `cargo test --bin telemt` binary so
 # bench cells never race a rebuild against a changing worktree.
+# TELEMT_WEB_E2E_GET_HEADER_BYTES=40000 enables GET header payload in the
+# fixture; TELEMT_E2E_NGINX_HEADERS=default runs the edge with stock nginx
+# request-head buffers (4 x 8k) so header payload must fall back to URL-only.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,9 +31,29 @@ if [ ! -s certs/proxy.example.com.crt ]; then
     -addext "subjectAltName=DNS:proxy.example.com" >/dev/null 2>&1
 fi
 
-# A previous fixture run still owns the port; replace it.
-pkill -f 'get_carrier_browser_fixture' 2>/dev/null || true
-sleep 0.5
+HEADER_BYTES="${TELEMT_WEB_E2E_GET_HEADER_BYTES:-0}"
+NGINX_HEADERS="${TELEMT_E2E_NGINX_HEADERS:-large}"
+if [ "$HEADER_BYTES" = "0" ]; then
+  HEADER_MODE=off
+elif [ "$NGINX_HEADERS" = "default" ]; then
+  HEADER_MODE=fallback
+else
+  HEADER_MODE=on
+fi
+
+# A previous fixture run still owns the port; stop exactly the process this
+# runner started last time (its PID is recorded below), never by name.
+PIDFILE="$ARTIFACTS/fixture.pid"
+if [ -s "$PIDFILE" ]; then
+  OLD_PID=$(cat "$PIDFILE")
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    # setsid made the fixture a process-group leader: stop its whole group
+    # (cargo plus the test binary it spawned).
+    kill -- "-$OLD_PID" 2>/dev/null || kill "$OLD_PID" 2>/dev/null || true
+    for _ in $(seq 1 40); do kill -0 "$OLD_PID" 2>/dev/null || break; sleep 0.25; done
+  fi
+  rm -f "$PIDFILE"
+fi
 
 # Real WEB HTTP stack on 0.0.0.0:$PORT with the test fixture backend enabled.
 # setsid detaches it from this shell so it survives the runner's exit.
@@ -40,6 +63,7 @@ if [ -n "${TELEMT_E2E_BIN:-}" ]; then
     TELEMT_WEB_GET_E2E_ECHO=1 \
     TELEMT_WEB_E2E_CARRIER="$CARRIER" \
     TELEMT_WEB_E2E_METHOD="${TELEMT_WEB_E2E_METHOD:-get}" \
+    TELEMT_WEB_E2E_GET_HEADER_BYTES="$HEADER_BYTES" \
     TELEMT_WEB_E2E_PORT="$PORT" \
     "$TELEMT_E2E_BIN" get_carrier_browser_fixture --ignored --nocapture \
     >"$ARTIFACTS/telemt-$CARRIER.log" 2>&1 < /dev/null &
@@ -49,6 +73,7 @@ else
     TELEMT_WEB_GET_E2E_ECHO=1 \
     TELEMT_WEB_E2E_CARRIER="$CARRIER" \
     TELEMT_WEB_E2E_METHOD="${TELEMT_WEB_E2E_METHOD:-get}" \
+    TELEMT_WEB_E2E_GET_HEADER_BYTES="$HEADER_BYTES" \
     TELEMT_WEB_E2E_PORT="$PORT" \
     CARGO_TARGET_DIR=/home/rerowros/telemt-target \
     cargo test --manifest-path ../../Cargo.toml --bin telemt \
@@ -56,7 +81,8 @@ else
     >"$ARTIFACTS/telemt-$CARRIER.log" 2>&1 < /dev/null &
 fi
 TELEMT_PID=$!
-echo "telemt fixture pid=$TELEMT_PID log=$ARTIFACTS/telemt-$CARRIER.log"
+echo "$TELEMT_PID" > "$PIDFILE"
+echo "telemt fixture pid=$TELEMT_PID log=$ARTIFACTS/telemt-$CARRIER.log header_mode=$HEADER_MODE"
 
 CAP=""
 for _ in $(seq 1 480); do
@@ -68,10 +94,19 @@ done
 [ -n "$CAP" ] || { echo "fixture did not become ready"; exit 1; }
 echo "capability=$CAP carrier=$CARRIER"
 
+# The edge config is rendered per run: stock nginx request-head buffers for
+# the header-payload fallback runs, 8 x 16k otherwise.
+NGINX_CONF="$ARTIFACTS/nginx-$NGINX_HEADERS.conf"
+if [ "$NGINX_HEADERS" = "default" ]; then
+  sed 's/large_client_header_buffers 8 16k;/large_client_header_buffers 4 8k;/' nginx.conf > "$NGINX_CONF"
+else
+  cp nginx.conf "$NGINX_CONF"
+fi
+
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" \
   -p 443:443 -p 8443:8443 -p 9443:9443 -p 10443:10443 -p "$PARENT_PORT:$PARENT_PORT" \
-  -v "$PWD/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  -v "$NGINX_CONF:/etc/nginx/nginx.conf:ro" \
   -v "$PWD/edge-proxy.conf:/etc/nginx/edge-proxy.conf:ro" \
   -v "$PWD/certs:/etc/nginx/certs:ro" \
   -v "$PWD/www:/e2e-www:ro" \
@@ -87,7 +122,16 @@ done
 [ "${code:-}" = "200" ] || { echo "edge did not become ready (last=$code)"; docker logs "$CONTAINER"; exit 1; }
 
 # Playwright runs on the Windows host where the pinned browsers live.
-WIN_DIR=$(wslpath -w "$PWD")
+# wslpath occasionally fails transiently under load; retry briefly.
+WIN_DIR=""
+for _ in 1 2 3 4 5; do
+  WIN_DIR=$(wslpath -w "$PWD" 2>/dev/null) && [ -n "$WIN_DIR" ] && break
+  sleep 1
+done
+[ -n "$WIN_DIR" ] || { echo "wslpath failed for $PWD" >&2; exit 1; }
+# WSLENV hands the header mode to the Windows node process.
+export E2E_HEADER_MODE="$HEADER_MODE" E2E_HEADER_BYTES="$HEADER_BYTES"
+export WSLENV="${WSLENV:+$WSLENV:}E2E_HEADER_MODE:E2E_HEADER_BYTES"
 if [ "$MODE" = "bench" ]; then
   # run.sh <carrier> bench <method> <rtt_ms> <edge_origin> [label]
   BENCH_METHOD="${3:-get}"

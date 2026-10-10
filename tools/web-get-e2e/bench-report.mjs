@@ -29,16 +29,21 @@ const rows = fs
       p50l: cell.pingLoad ? cell.pingLoad.p50.toFixed(0) : "fail",
       p95l: cell.pingLoad ? cell.pingLoad.p95.toFixed(0) : "fail",
       edge,
+      // Header-carrying requests / refused by the edge (geth, gethf cells).
+      hdr:
+        cell.audit && cell.audit.headers && cell.audit.headers.mode !== "off"
+          ? `${cell.audit.headers.carrying}/${cell.audit.headers.refused}`
+          : "-",
     };
   });
 
 const header =
-  "| cell | edge | up MiB/s | down MiB/s | ping idle p50/p95 | ping load p50/p95 | ok |\n" +
-  "|---|---|---|---|---|---|---|\n";
+  "| cell | edge | up MiB/s | down MiB/s | ping idle p50/p95 | ping load p50/p95 | hdr req/refused | ok |\n" +
+  "|---|---|---|---|---|---|---|---|\n";
 const body = rows
   .map(
     (r) =>
-      `| ${r.cell} | ${r.edge} | ${r.up} | ${r.down} | ${r.p50i}/${r.p95i} | ${r.p50l}/${r.p95l} | ${r.ok} |\n`,
+      `| ${r.cell} | ${r.edge} | ${r.up} | ${r.down} | ${r.p50i}/${r.p95i} | ${r.p50l}/${r.p95l} | ${r.hdr} | ${r.ok} |\n`,
   )
   .join("");
 const md = `# bench ${prefix}\n\n${header}${body}`;
