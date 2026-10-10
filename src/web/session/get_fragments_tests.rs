@@ -650,3 +650,31 @@ async fn resliced_operation_supersedes_a_pending_layout() {
 
     manager.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_lone_final_of_a_larger_layout_leaves_the_pending_assembly() {
+    let (session, manager) = session();
+    session.configure_conveyor(4);
+    let body = pongs(96);
+    for part in 0..2u32 {
+        let chunk = body.slice(part as usize * 32..(part as usize + 1) * 32);
+        assert!(matches!(
+            session.offer_get_up(None, 1, Some(0), part, 3, chunk),
+            Ok(GetUpOffer::Pending(_))
+        ));
+    }
+    // A final part cannot open the larger layout, so it supersedes nothing.
+    assert!(matches!(
+        session.offer_get_up(None, 1, Some(0), 5, 6, body.slice(80..)),
+        Err(GetUpReject::Decoy)
+    ));
+    let Ok(GetUpOffer::Complete {
+        body: assembled, ..
+    }) = session.offer_get_up(None, 1, Some(0), 2, 3, body.slice(64..))
+    else {
+        panic!("the original layout still completes");
+    };
+    assert_eq!(assembled, body);
+
+    manager.shutdown().await;
+}

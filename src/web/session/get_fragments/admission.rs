@@ -114,8 +114,10 @@ impl WebSession {
             // record retires so the new layout replays through reassembly and
             // the canonical digest check. A layout with fewer parts (a late
             // part of the abandoned layout) still decoys, so layouts never
-            // flip back and forth.
-            if state
+            // flip back and forth. Only a non-final part supersedes: a final
+            // part can never open the new layout, so it must not drop the
+            // record it would be rejected against anyway.
+            let superseded = state
                 .get_fragments
                 .completed
                 .get(&key)
@@ -124,8 +126,8 @@ impl WebSession {
                     .get_fragments
                     .pending
                     .get(&key)
-                    .is_some_and(|assembly| assembly.total_parts < total)
-            {
+                    .is_some_and(|assembly| assembly.total_parts < total);
+            if superseded && part + 1 < total {
                 state.get_fragments.retire_record(key, &mut retired);
             }
             if let Some(completed) = state.get_fragments.completed.get(&key) {
