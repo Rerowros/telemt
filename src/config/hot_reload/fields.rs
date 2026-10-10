@@ -342,6 +342,9 @@ pub(super) fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyC
     cfg.access.user_max_unique_ips_global_each = new.access.user_max_unique_ips_global_each;
     cfg.access.user_max_unique_ips_mode = new.access.user_max_unique_ips_mode;
     cfg.access.user_max_unique_ips_window_secs = new.access.user_max_unique_ips_window_secs;
+    // Limits size process-wide envelopes and stay restart-only, the global
+    // `limits.get_header_bytes` included; the per-vhost `get_header_bytes`
+    // override arrives with `new.web` and follows the reload.
     let process_limits = cfg.web.limits.clone();
     let decoy_fasttrack_mode = cfg.web.decoy_fasttrack_mode;
     cfg.web = new.web.clone();

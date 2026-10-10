@@ -25,6 +25,9 @@
 //! reconciled only during privileged startup.
 //! `web.decoy_fasttrack_mode` is also restart-only so one process never mixes
 //! capability timing policies or process-lifetime counter semantics.
+//! `web.limits.*` is process-owned and restart-only, including the global
+//! `web.limits.get_header_bytes`; only the per-vhost `get_header_bytes`
+//! override above follows a reload.
 //! Non-hot changes are never mixed into the runtime config snapshot.
 
 use std::collections::BTreeSet;
