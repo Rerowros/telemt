@@ -81,6 +81,7 @@ fn get_carrier_page_executes_query_encoded_requests_on_every_route() {
             WebCarrierMethod::Get,
             7168,
             6,
+            0,
             &SecureRandom::new(),
         );
         assert!(!page.body.contains("__"));

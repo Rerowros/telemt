@@ -21,6 +21,11 @@ function renderedPage(overrides = {}) {
         /const getParallelParts=\d+;/,
         `const getParallelParts=${overrides.GET_PARALLEL_PARTS};`,
       );
+    if (overrides.GET_HEADER_BYTES !== undefined)
+      page = page.replace(
+        /const getHeaderBytes=\d+,/,
+        `const getHeaderBytes=${overrides.GET_HEADER_BYTES},`,
+      );
     return page;
   }
   let page = fs.readFileSync(path.join(__dirname, "document.html"), "utf8");
@@ -59,6 +64,8 @@ function renderedPage(overrides = {}) {
       CARRIER_PROBE_COALESCE_MS: 0,
       GET_URL_BYTES: URL_BYTES,
       GET_PARALLEL_PARTS: 6,
+      GET_HEADER_BYTES: 0,
+      GET_HEADER_CHUNK: 7680,
       BATCH_LIMIT: 2097152,
       QUEUE_LIMIT: 33554432,
       QUEUE_ITEMS: 16384,
@@ -1517,6 +1524,346 @@ test("recovery fetches the policy document with a unique nonce per call", async 
   assert.notEqual(params(again.url).get("n"), nonce);
   recovery.cancel();
   await second;
+  env.close();
+  await flush();
+});
+
+// Header payload: big GET fragments carry base64url payload in indexed
+// X-Up-Data-N headers after the URL `d` value; edges that refuse those
+// request heads downgrade the page to URL-only exactly once.
+const HEADER_BYTES = 40000,
+  HEADER_CHUNK = 7680;
+function headerClient(env, overrides = {}) {
+  return client(
+    env,
+    Object.assign(
+      {
+        headerBytes: () => HEADER_BYTES,
+        headerChunk: () => HEADER_CHUNK,
+        parallelParts: () => 1,
+      },
+      overrides,
+    ),
+  );
+}
+function payloadLines(request) {
+  const headers = request.options.headers || {},
+    lines = [];
+  for (let i = 0; headers["X-Up-Data-" + i] !== undefined; i++)
+    lines.push(headers["X-Up-Data-" + i]);
+  const named = Object.keys(headers).filter((name) =>
+    /^x-up-data-/i.test(name),
+  );
+  assert.equal(named.length, lines.length, "payload indexes are contiguous");
+  return lines;
+}
+function fragmentBytes(request) {
+  return decode(params(request.url).get("d") + payloadLines(request).join(""));
+}
+function varied(length, seed) {
+  return Array.from({ length }, (_, i) => (i * 7 + seed) % 251);
+}
+function live(env) {
+  return ups(env).filter((r) => !r.answered && !r.options.signal.aborted);
+}
+// Answers every live fragment of one sequence with the acknowledgement the
+// server would send, until the final part is acknowledged.
+async function ackAll(env, sequence, seen = []) {
+  for (let step = 0; step < 4096; step++) {
+    const request = live(env).filter(
+      (r) => params(r.url).get("s") === String(sequence),
+    )[0];
+    if (!request) {
+      await flush();
+      continue;
+    }
+    const query = params(request.url),
+      part = query.get("p") || "0",
+      total = query.get("pn");
+    const last = total === null || part === String(Number(total) - 1);
+    env.answer(
+      request,
+      204,
+      null,
+      last
+        ? { "X-Up-Ack": String(sequence), "X-Up-Part": part }
+        : { "X-Up-Part": part },
+    );
+    seen.push(request);
+    await flush();
+    if (last) return seen;
+  }
+  throw new Error("operation never completed");
+}
+function upload(requestClient, body, sequence, attempts = 1) {
+  return requestClient.send(
+    "/api/v1/up",
+    requestClient.options(
+      "POST",
+      SESSION,
+      body,
+      { "X-Up-Seq": String(sequence) },
+      null,
+    ),
+    null,
+    attempts,
+    null,
+  );
+}
+function reassemble(requests) {
+  const ordered = [...requests].sort(
+    (a, b) =>
+      Number(params(a.url).get("p") || 0) - Number(params(b.url).get("p") || 0),
+  );
+  const bytes = [];
+  for (const request of ordered)
+    for (const byte of fragmentBytes(request)) bytes.push(byte);
+  return new Uint8Array(bytes);
+}
+
+test("header payload carries big fragments in indexed lines with metadata in the URL", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { parallelParts: () => 3 });
+  const body = frame(2, 1, varied(100000, 3));
+  const operation = upload(requestClient, body, 7);
+  await flush();
+  const parts = await ackAll(env, 7);
+  assert.equal((await operation).status, 204);
+  const total = Number(params(parts[0].url).get("pn"));
+  // URL-only fragments carry ~5 KiB: header payload needs far fewer parts.
+  assert.ok(total >= 2 && total <= 4, "parts: " + total);
+  assert.equal(parts.length, total);
+  const nonces = new Set();
+  for (const request of parts) {
+    const query = params(request.url),
+      lines = payloadLines(request);
+    assert.equal(query.get("s"), "7");
+    assert.equal(query.get("pn"), String(total));
+    assert.ok(request.url.length <= URL_BYTES, "url " + request.url.length);
+    assert.ok(
+      lines.every((line) => line.length > 0 && line.length <= HEADER_CHUNK),
+    );
+    assert.ok(lines.reduce((n, line) => n + line.length, 0) <= HEADER_BYTES);
+    if (query.get("p") !== String(total - 1))
+      assert.ok(lines.length >= 5, "non-final parts fill the header budget");
+    nonces.add(query.get("n"));
+  }
+  assert.equal(nonces.size, parts.length);
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
+  env.close();
+  await flush();
+});
+
+test("small uplinks, polls, and session creation stay header-free", async () => {
+  const env = await session(renderedPage({ GET_HEADER_BYTES: HEADER_BYTES }));
+  const create = env.requests.find(
+    (r) => pathname(r.url) === "/api/v1/session",
+  );
+  assert.equal(payloadLines(create).length, 0);
+  const requestClient = headerClient(env);
+  const small = upload(requestClient, frame(2, 1, varied(4000, 1)), 7);
+  await flush();
+  const [single] = await ackAll(env, 7);
+  assert.equal(params(single.url).get("pn"), null, "one URL-only request");
+  assert.equal(payloadLines(single).length, 0);
+  assert.equal((await small).status, 204);
+  for (const poll of env.requests.filter(
+    (r) => pathname(r.url) === "/api/v1/down",
+  ))
+    assert.equal(payloadLines(poll).length, 0);
+  env.close();
+  await flush();
+});
+
+test("the rendered header budget reaches the request runtime", async () => {
+  const env = await session(renderedPage({ GET_HEADER_BYTES: HEADER_BYTES }));
+  env.send(join(frame(1, 1), frame(2, 1, varied(60000, 5))));
+  await flush();
+  const first = live(env)[0];
+  assert.ok(first, "uplink started");
+  assert.ok(
+    payloadLines(first).length > 0,
+    "page budget enables header payload",
+  );
+  env.close();
+  await flush();
+});
+
+test("an edge 400 downgrades the page once and reslices the operation URL-only", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { parallelParts: () => 3 });
+  const body = frame(2, 1, varied(200000, 9));
+  const operation = upload(requestClient, body, 7);
+  await flush();
+  const headerParts = live(env);
+  assert.equal(headerParts.length, 3);
+  assert.ok(headerParts.every((r) => payloadLines(r).length > 0));
+  const headerTotal = params(headerParts[0].url).get("pn");
+  // nginx answers an oversized request head with 400 before forwarding.
+  env.answer(headerParts[0], 400, null, {});
+  await flush();
+  assert.ok(
+    headerParts.slice(1).every((r) => r.options.signal.aborted),
+    "sibling header parts are cancelled",
+  );
+  const parts = await ackAll(env, 7);
+  assert.equal((await operation).status, 204);
+  assert.ok(parts.every((r) => payloadLines(r).length === 0));
+  const urlTotal = params(parts[0].url).get("pn");
+  assert.ok(
+    Number(urlTotal) > Number(headerTotal),
+    "the operation is resliced",
+  );
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
+  // Header-carrying requests were only the three first in-flight parts.
+  assert.equal(ups(env).filter((r) => payloadLines(r).length > 0).length, 3);
+  // Later operations start URL-only: the downgrade is for the whole page.
+  const next = upload(requestClient, frame(2, 1, varied(60000, 4)), 8);
+  await flush();
+  const later = await ackAll(env, 8);
+  assert.equal((await next).status, 204);
+  assert.ok(later.every((r) => payloadLines(r).length === 0));
+  env.close();
+  await flush();
+});
+
+test("an unproven page downgrades after two transport failures in a row", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env);
+  // 30 KB fits one header-carrying request.
+  const body = frame(2, 1, varied(30000, 2));
+  const operation = upload(requestClient, body, 7);
+  await flush();
+  for (let i = 0; i < 2; i++) {
+    const [lost] = live(env);
+    assert.ok(
+      payloadLines(lost).length > 0,
+      "attempt " + i + " carries headers",
+    );
+    assert.equal(params(lost.url).get("pn"), null);
+    lost.answered = true;
+    lost.reject(new TypeError("Failed to fetch"));
+    await flush();
+  }
+  const parts = await ackAll(env, 7);
+  assert.equal((await operation).status, 204);
+  assert.ok(parts.length > 1, "resliced into URL-only fragments");
+  assert.ok(parts.every((r) => payloadLines(r).length === 0));
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
+  assert.equal(ups(env).filter((r) => payloadLines(r).length > 0).length, 2);
+  env.close();
+  await flush();
+});
+
+test("a proven page keeps header mode through an outage until a URL-only answer", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env);
+  // A first header-carrying answer proves the edge.
+  const first = upload(requestClient, frame(2, 1, varied(30000, 6)), 7);
+  await flush();
+  await ackAll(env, 7);
+  assert.equal((await first).status, 204);
+  // A network outage fails the next operation twice (request + reissue):
+  // no URL-only request was answered, so the page keeps header mode.
+  const body = frame(2, 1, varied(30000, 8));
+  let failure = null;
+  upload(requestClient, body, 8).catch((error) => {
+    failure = error;
+  });
+  await flush();
+  for (let i = 0; i < 2; i++) {
+    const [lost] = live(env);
+    assert.ok(payloadLines(lost).length > 0);
+    lost.answered = true;
+    lost.reject(new TypeError("Failed to fetch"));
+    await flush();
+  }
+  assert.ok(failure, "the operation escalates to recovery as before");
+  assert.equal(failure.telemtReason, "network");
+  // The recovery replay still carries headers.
+  const replay = upload(requestClient, body, 8);
+  await flush();
+  const [again] = live(env);
+  assert.ok(payloadLines(again).length > 0, "header mode survives the outage");
+  // A URL-only request is answered while header requests keep failing: the
+  // edge refuses the request heads, so the page downgrades and reslices.
+  const poll = requestClient.send(
+    "/api/v1/down",
+    requestClient.options(
+      "POST",
+      SESSION,
+      null,
+      { "X-Down-Cursor": "0" },
+      null,
+    ),
+    null,
+    1,
+    null,
+  );
+  await flush();
+  env.answer(env.pending("/api/v1/down")[0], 204, null, {});
+  assert.equal((await poll).status, 204);
+  again.answered = true;
+  again.reject(new TypeError("Failed to fetch"));
+  await flush();
+  const parts = await ackAll(env, 8);
+  assert.equal((await replay).status, 204);
+  assert.ok(
+    parts.length > 1 && parts.every((r) => payloadLines(r).length === 0),
+  );
+  assert.deepEqual(reassemble(parts), new Uint8Array(body));
+  env.close();
+  await flush();
+});
+
+test("a 400 after acknowledged parts keeps the operation layout", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { retryMs: () => 5000 });
+  const body = frame(2, 1, varied(100000, 11));
+  const operation = upload(requestClient, body, 7);
+  await flush();
+  const [part0] = live(env);
+  const total = params(part0.url).get("pn");
+  env.answer(part0, 204, null, { "X-Up-Part": "0" });
+  await flush();
+  const [part1] = live(env);
+  assert.equal(params(part1.url).get("p"), "1");
+  env.answer(part1, 400, null, {});
+  await flush();
+  // The retry waits one short backoff, well inside the request deadline.
+  await env.tick(400);
+  // Acknowledged parts fixed the server-side layout: the same part is
+  // retried with the same index, count, and payload headers.
+  const [retry] = live(env);
+  assert.equal(params(retry.url).get("p"), "1");
+  assert.equal(params(retry.url).get("pn"), total);
+  assert.deepEqual(fragmentBytes(retry), fragmentBytes(part1));
+  const rest = await ackAll(env, 7);
+  assert.equal((await operation).status, 204);
+  assert.deepEqual(reassemble([part0, ...rest]), new Uint8Array(body));
+  // The page itself is downgraded for the next operation.
+  const next = upload(requestClient, frame(2, 1, varied(60000, 1)), 8);
+  await flush();
+  const later = await ackAll(env, 8);
+  assert.equal((await next).status, 204);
+  assert.ok(later.every((r) => payloadLines(r).length === 0));
+  env.close();
+  await flush();
+});
+
+test("the POST carrier never sends payload headers", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { method: () => "POST" });
+  const body = frame(2, 1, varied(100000, 13));
+  const operation = upload(requestClient, body, 7);
+  await flush();
+  const [post] = ups(env);
+  assert.equal(post.options.method, "POST");
+  assert.equal(post.url, "https://proxy.example.com/api/v1/up");
+  assert.equal(new Uint8Array(post.options.body).length, body.byteLength);
+  assert.equal(payloadLines(post).length, 0);
+  env.answer(post, 204, null, { "X-Up-Ack": "7" });
+  assert.equal((await operation).status, 204);
   env.close();
   await flush();
 });

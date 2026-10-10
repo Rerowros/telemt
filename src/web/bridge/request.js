@@ -27,7 +27,15 @@ const get=(()=>{
   if(data!==undefined){params.set('d',data);if(total>1){params.set('p',String(part));params.set('pn',String(total))}}
   return target+'?'+params.toString();
  }
- return Object.freeze({nonce,encode,slices,chunks,url});
+ // Splits one encoded fragment into the URL `d` value (the first urlChars)
+ // and indexed payload header lines of at most chunk characters each; the
+ // server joins `d` and the lines in index order before decoding.
+ function split(encoded,urlChars,chunk){
+  const lines={};let count=0;
+  for(let i=urlChars;i<encoded.length;i+=chunk)lines['X-Up-Data-'+(count++)]=encoded.slice(i,i+chunk);
+  return{data:encoded.slice(0,urlChars),lines,count};
+ }
+ return Object.freeze({nonce,encode,slices,chunks,url,split});
 })();
 function create(settings){
  const pause=(milliseconds,signal)=>new Promise((resolve,reject)=>{
@@ -122,6 +130,27 @@ function create(settings){
   return 0;
  }
  function retryableStatus(status){return status===408||status===429||status===502||status===503||status===504}
+ // Page-wide health of GET header payload. Header mode is one-way: once an
+ // edge shows it cannot pass the payload headers the page stays URL-only.
+ // - a status that edges use for oversized request heads (400, 413, 431,
+ //   nginx 494) on a header-carrying request downgrades at once;
+ // - transport failures (network error or timeout) of header-carrying
+ //   requests downgrade after two in a row with no header-carrying response
+ //   in between, when either no header-carrying request was ever answered on
+ //   this page or a URL-only request was answered after the first of them,
+ //   so a plain network outage on a proven edge never disables the mode.
+ const headerHealth={off:false,proven:false,streak:0,streakAt:0,smallAt:0,clock:0};
+ function headerLimitStatus(status){return status===400||status===413||status===431||status===494}
+ function headerBudget(){return headerHealth.off||!settings.headerBytes?0:Math.max(0,Math.floor(settings.headerBytes())||0)}
+ function headerAnswered(){headerHealth.proven=true;headerHealth.streak=0}
+ function smallAnswered(){headerHealth.smallAt=++headerHealth.clock}
+ function headerFault(transport){
+  if(headerHealth.off)return;
+  if(!transport){headerHealth.off=true;return}
+  if(!headerHealth.streak)headerHealth.streakAt=++headerHealth.clock;
+  headerHealth.streak++;
+  if(headerHealth.streak>=2&&(!headerHealth.proven||headerHealth.smallAt>headerHealth.streakAt))headerHealth.off=true;
+ }
  function responsePolicy(path,status){
   if(path==='/api/v1/session'&&status===200)return {limit:8,exact:true,reason:'protocol'};
   if(path==='/api/v1/down'&&status===200)return {limit:settings.batchLimit(),exact:false,reason:'protocol'};
@@ -177,11 +206,16 @@ function create(settings){
   const headers=frozenOptions.headers||{},close=frozenOptions.method==='DELETE',body=frozenOptions.body;
   const getFrozen=Object.assign({},frozenOptions,{method:'GET',body:undefined});
   const widest='9'.repeat(24);
-  let parts=null;
+  let parts=null,urlChars=0,headerChunk=0;
   if(body&&body.byteLength){
    const overhead=get.url(settings.base()+path,headers,widest,close,'',4095,4096).length;
-   const raw=Math.floor((settings.getUrlBytes()-overhead)/4)*3;
+   urlChars=Math.floor((settings.getUrlBytes()-overhead)/4)*4;
+   let raw=urlChars/4*3;
    if(raw<1)throw settings.failure('protocol','get url budget exceeded');
+   // Header mode only for uplink bodies that do not fit one URL: the extra
+   // budget rides in indexed payload headers, metadata stays in the URL.
+   const extra=path==='/api/v1/up'&&body.byteLength>raw?headerBudget():0;
+   if(extra>0){headerChunk=Math.max(4,settings.headerChunk?settings.headerChunk():extra);raw=Math.floor((urlChars+extra)/4)*3}
    parts=get.slices(body,raw);
    if(parts.length>4096)throw settings.failure('protocol','get part limit exceeded');
   }
@@ -208,13 +242,14 @@ function create(settings){
     if(remaining<=0)return{kind:'budget'};
     // The URL is composed before the abort listener so a budget or nonce
     // failure can never leave an external listener installed.
-    const data=parts?get.encode(parts[part]):undefined;
+    let data=parts?get.encode(parts[part]):undefined,lines=null;
+    if(data!==undefined&&headerChunk>0&&data.length>urlChars){const split=get.split(data,urlChars,headerChunk);data=split.data;lines=split.lines}
     const target=get.url(settings.base()+path,headers,get.nonce(),close,data,part,total);
     if(target.length>settings.getUrlBytes())throw settings.failure('protocol','get url budget exceeded');
     const controller=new AbortController(),abort=()=>controller.abort();let timedOut=false,slot=false,bypass=false,acked=false;
     if(external)external.addEventListener('abort',abort,{once:true});
     if(opSignal)opSignal.addEventListener('abort',abort,{once:true});
-    const requestOptions=Object.assign({},getFrozen,{signal:controller.signal});
+    const requestOptions=Object.assign({},getFrozen,{signal:controller.signal},lines?{headers:Object.assign({},getFrozen.headers,lines)}:{});
     let wait=0,timer=null;
     try{
      // Only non-final parts of a fragmented uplink share the parallel pool:
@@ -229,6 +264,12 @@ function create(settings){
      if(left<=0)return{kind:'budget'};
      timer=setTimeout(()=>{timedOut=true;controller.abort()},Math.max(1,Math.min(attemptLimit,left)));
      const fetched=await fetch(target,requestOptions);
+     if(lines){
+      // An edge refusing the request head never forwarded it, so the part
+      // is replayed (URL-only after the downgrade) like a retry.
+      if(headerLimitStatus(fetched.status)){headerFault(false);settings.cancel(fetched);return{kind:'retry',reason:'http',wait:0,header:true}}
+      headerAnswered();
+     }else smallAnswered();
      if(retryableStatus(fetched.status)){wait=retryAfterMs(fetched);settings.cancel(fetched);return{kind:'retry',reason:'http',wait}}
      const policy=responsePolicy(path,fetched.status);let payload;
      const partReceiver=part===total-1?receiver:(next,signal)=>settings.read(next,0,true,signal);
@@ -255,8 +296,11 @@ function create(settings){
      controller.abort();
      if(settings.closed()||(external&&external.aborted)||(opSignal&&opSignal.aborted))throw error;
      if(settings.reason(error,'')==='protocol')throw error;
-     if(timedOut)return{kind:'retry',reason:'timeout',wait:0};
-     return{kind:'retry',reason:'network',wait};
+     // The server answers a non-final fragment at once, so only there a
+     // timeout is a transport fault; a final part may be legitimately held.
+     if(lines&&(!timedOut||(uplink&&total>1&&part<total-1)))headerFault(true);
+     if(timedOut)return{kind:'retry',reason:'timeout',wait:0,header:!!lines};
+     return{kind:'retry',reason:'network',wait,header:!!lines};
     }finally{
      if(timer!==null)clearTimeout(timer);
      if(slot)getScheduler.release(acked&&partsAcked===total-1);
@@ -283,6 +327,10 @@ function create(settings){
      if(opSignal&&opSignal.aborted)return{kind:'stop',reason:'cancelled',lastReason};
      if(attemptCount>=attempts())return{kind:'stop',reason:'attempts',lastReason};
      const outcome=await attempt(part,opSignal);
+     // A header-carrying attempt after the page left header mode restarts
+     // the operation URL-only, but only while none of its parts was
+     // acknowledged: acknowledged parts fixed the server-side part layout.
+     if(outcome.header&&headerHealth.off&&partsAcked===0)return{kind:'reslice'};
      if(outcome.kind!=='retry'&&outcome.kind!=='budget')return outcome;
      if(outcome.kind==='retry'&&reissue>0&&(outcome.reason==='network'||(pooled&&outcome.reason==='timeout'))){reissue--;continue}
      lastReason=outcome.reason||lastReason;
@@ -305,7 +353,7 @@ function create(settings){
     // Non-final parts run through a bounded worker pool; the final part is
     // sent only after every earlier fragment is acknowledged server-side.
     const opAbort=new AbortController(),opSignal=opAbort.signal;
-    let next=0,accepted=0,terminal=null,reason='network',closing=false;
+    let next=0,accepted=0,terminal=null,reason='network',closing=false,reslice=false;
     const workers=Math.min(settings.parallelParts?settings.parallelParts():1,total-1);
     rank=getScheduler.rank();getScheduler.opOpen();
     try{
@@ -318,6 +366,7 @@ function create(settings){
        try{outcome=await sendPart(part,opSignal)}catch(error){if(opSignal.aborted)return;throw error}
        if(outcome.kind==='part'){accepted++;continue}
        if(outcome.kind==='terminal'){terminal=outcome.response;opAbort.abort();return}
+       if(outcome.kind==='reslice'){reslice=true;opAbort.abort();return}
        reason=outcome.lastReason||reason;return;
       }
      })());
@@ -325,6 +374,8 @@ function create(settings){
      closing=!terminal&&accepted===total-1;
     }finally{opAbort.abort();if(!closing)getScheduler.opClose()}
     if(terminal)return terminal;
+    // Bounded: the restarted operation is sliced URL-only and never reslices.
+    if(reslice&&partsAcked===0)return sendGet(path,frozenOptions,remainingBudget,maxAttempts,receiver);
     if(!closing)throw settings.failure(reason,'carrier retry limit reached');
     // The operation stays open until its closing part settles, so the
     // scheduler regrants the handed-off connection only afterwards.
@@ -340,6 +391,7 @@ function create(settings){
    for(;;){
     if(part>=total)return null;
     const outcome=await sendPart(part,null);
+    if(outcome.kind==='reslice')return sendGet(path,frozenOptions,remainingBudget,maxAttempts,receiver);
     if(outcome.kind==='part'){part++;continue}
     if(outcome.kind==='done'||outcome.kind==='terminal')return outcome.response;
     lastReason=outcome.lastReason||lastReason;break;

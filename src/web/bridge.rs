@@ -64,6 +64,7 @@ pub(crate) fn render(
         carrier_method,
         defaults.get_url_bytes,
         defaults.get_parallel_parts,
+        defaults.get_header_bytes,
         rng,
     )
 }
@@ -92,6 +93,7 @@ pub(crate) fn render_with_get_url(
     carrier_method: WebCarrierMethod,
     get_url_bytes: usize,
     get_parallel_parts: usize,
+    get_header_bytes: usize,
     rng: &SecureRandom,
 ) -> BridgePage {
     let mut nonce = [0u8; 18];
@@ -187,6 +189,11 @@ pub(crate) fn render_with_get_url(
         .replace("__CARRIER_METHOD__", carrier_method.as_str())
         .replace("__GET_URL_BYTES__", &get_url_bytes.to_string())
         .replace("__GET_PARALLEL_PARTS__", &get_parallel_parts.to_string())
+        .replace("__GET_HEADER_BYTES__", &get_header_bytes.to_string())
+        .replace(
+            "__GET_HEADER_CHUNK__",
+            &crate::config::GET_HEADER_CHUNK_CHARS.to_string(),
+        )
         .replace("__BATCH_LIMIT__", &batch_limit.to_string())
         .replace("__QUEUE_LIMIT__", &queue_limit.to_string())
         .replace("__QUEUE_ITEMS__", &queue_items.to_string())

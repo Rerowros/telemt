@@ -403,6 +403,7 @@ async fn handle_root(
         config.web.effective_carrier_method(&vhost.host),
         config.web.limits.get_url_bytes,
         config.web.limits.get_parallel_parts,
+        config.web.effective_get_header_bytes(&vhost.host),
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));

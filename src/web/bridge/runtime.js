@@ -14,6 +14,9 @@ const getUrlBytes=__GET_URL_BYTES__;
 // GET uplink fragment parallelism is page-owned; the edge-protocol scheduler
 // inside the request runtime adapts the effective cap.
 const getParallelParts=__GET_PARALLEL_PARTS__;
+// Page-owned header payload budget for GET uplink fragments (0 = URL only)
+// and the fixed length of one payload header line.
+const getHeaderBytes=__GET_HEADER_BYTES__,getHeaderChunk=__GET_HEADER_CHUNK__;
 let negotiationEnabled=__NEGOTIATION_ENABLED__,candidateCount=__CANDIDATE_COUNT__,candidateDeadlines=[__CARRIER_DEADLINES__];
 let longPollMs=__LONG_POLL_SECS__*1000,bridgeRequestMs=__BRIDGE_REQUEST_SECS__*1000,bridgeRetryMs=__BRIDGE_RETRY_SECS__*1000;
 let bridgeRecoveryMs=__BRIDGE_RECOVERY_SECS__*1000,websocketOpenMs=__WEBSOCKET_OPEN_SECS__*1000,reconnectGraceMs=__RECONNECT_GRACE_SECS__*1000;
@@ -38,6 +41,7 @@ const requestClient=requestSupport.create({
  base:()=>relayBase,closed:()=>closed,retryMs:()=>bridgeRetryMs,longPollMs:()=>longPollMs,requestMs:()=>bridgeRequestMs,
  batchLimit:()=>batchLimit,read:(response,limit,exact,signal)=>responseBody.read(response,limit,exact,signal),cancel:responseBody.cancel,
  method:()=>carrierMethod,getUrlBytes:()=>getUrlBytes,parallelParts:()=>getParallelParts,
+ headerBytes:()=>getHeaderBytes,headerChunk:()=>getHeaderChunk,
  failure,reason:failureReason,retrying:()=>status('reconnecting')
 });
 const options=requestClient.options,pause=requestClient.pause,request=requestClient.send;
