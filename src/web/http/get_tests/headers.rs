@@ -644,6 +644,67 @@ Connection: close
     generation.stop_background_tasks().await;
 }
 
+#[tokio::test]
+async fn bounded_credential_scan_strips_unscanned_headers_before_the_decoy() {
+    let capability = [81u8; 32];
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = header_runtime_config(capability, WebCarrier::Https, 40000);
+    let runtime_config = Arc::get_mut(config.web.runtime.as_mut().unwrap()).unwrap();
+    let vhost = Arc::get_mut(runtime_config.vhosts.get_mut(HOST).unwrap()).unwrap();
+    vhost.decoy = WebRuntimeDecoy::HttpUpstream {
+        addr: origin.local_addr().unwrap(),
+        authority: "decoy.example".to_string(),
+    };
+    let generation = test_runtime_generation(1, config);
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let encoded = b64(&capability);
+
+    // 60 KB of canonical windows exhausts the keyed-check budget: the site is
+    // still served, and nothing the scan did not reach is forwarded.
+    let junk = "A".repeat(60_000);
+    let bytes = format!(
+        "GET /index.html HTTP/1.1\r\nHost: {HOST}\r\nX-Small: kept\r\nX-Junk: {junk}\r\nCookie: opaque={encoded}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (response, captured) = tokio::join!(request(&listener, &runtime, bytes), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), capture_upstream(&origin))
+            .await
+            .ok()
+    });
+    let captured = captured.expect("the stripped request reaches the decoy origin");
+    let forwarded = std::str::from_utf8(&captured).unwrap().to_lowercase();
+    assert!(response.ends_with(b"origin"));
+    assert!(forwarded.contains("x-small: kept"));
+    assert!(!forwarded.contains("x-junk"));
+    assert!(!forwarded.contains("cookie"));
+    assert!(!forwarded.contains(&encoded.to_lowercase()));
+
+    // A URI the budget cannot cover is fenced like a credential.
+    let bytes = format!(
+        "GET /{} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n",
+        "A".repeat(2_000)
+    )
+    .into_bytes();
+    let (response, captured) = tokio::join!(request(&listener, &runtime, bytes), async {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            capture_upstream(&origin),
+        )
+        .await
+        .ok()
+    });
+    assert!(
+        captured.is_none(),
+        "an unscanned URI reached the decoy origin"
+    );
+    assert!(response.starts_with(b"HTTP/1.1 404"));
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
 /// Creates one GET session with the negotiated uplink window of 4.
 async fn window_session(
     listener: &TcpListener,
