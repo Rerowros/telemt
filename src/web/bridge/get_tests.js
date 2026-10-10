@@ -1851,6 +1851,34 @@ test("a 431 after acknowledged parts keeps the operation layout", async () => {
   await flush();
 });
 
+test("a soft 400 on a pooled part spends the attempt cap", async () => {
+  const env = environment(renderedPage());
+  const requestClient = headerClient(env, { retryMs: () => 5000 });
+  const first = upload(requestClient, frame(2, 1, varied(30000, 6)), 7);
+  await flush();
+  await ackAll(env, 7);
+  assert.equal((await first).status, 204);
+  // A decoy answering the expired session refuses a non-final part with
+  // 400: the operation escalates to recovery instead of re-sending the
+  // ~47 KB part for the whole retry window.
+  let failure = null;
+  upload(requestClient, frame(2, 1, varied(100000, 3)), 8).catch((error) => {
+    failure = error;
+  });
+  await flush();
+  const [part0] = live(env);
+  assert.ok(Number(params(part0.url).get("pn")) > 1, "a pooled part");
+  assert.ok(payloadLines(part0).length > 0);
+  env.answer(part0, 400, null, {});
+  await flush();
+  await env.tick(1000);
+  await flush();
+  assert.ok(failure, "the operation stops after one refused attempt");
+  assert.equal(live(env).length, 0, "nothing is re-sent");
+  env.close();
+  await flush();
+});
+
 test("a proven page counts a 400 as a fault and needs a URL-only 2xx witness", async () => {
   const env = environment(renderedPage());
   const requestClient = headerClient(env);

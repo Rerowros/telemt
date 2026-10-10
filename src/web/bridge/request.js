@@ -269,7 +269,9 @@ function create(settings){
      if(lines){
       // An edge refusing the request head never forwarded it, so the part
       // is replayed (URL-only after the downgrade) like a retry.
-      if(headerLimitStatus(fetched.status)){headerFault(fetched.status===400&&headerHealth.proven);settings.cancel(fetched);return{kind:'retry',reason:'http',wait:0,header:true}}
+      // A 400 on a proven page is a soft fault (often a decoy answering an
+      // expired session): it spends the attempt cap even for a pooled part.
+      if(headerLimitStatus(fetched.status)){const soft=fetched.status===400&&headerHealth.proven;headerFault(soft);settings.cancel(fetched);return{kind:'retry',reason:'http',wait:0,header:true,soft}}
       headerAnswered();
      }else if(fetched.status>=200&&fetched.status<300)smallAnswered();
      if(retryableStatus(fetched.status)){wait=retryAfterMs(fetched);settings.cancel(fetched);return{kind:'retry',reason:'http',wait}}
@@ -341,7 +343,7 @@ function create(settings){
      // backpressure above all) waits inside the operation retry window
      // without spending the attempt cap; every other request counts each
      // failure exactly like the POST carrier and escalates to recovery.
-     if(!(pooled&&outcome.reason==='http'))attemptCount++;
+     if(!(pooled&&outcome.reason==='http'&&!outcome.soft))attemptCount++;
      if(outcome.kind==='budget'||attemptCount>=attempts())return{kind:'stop',reason:'budget',lastReason};
      const after=Math.min(deadline-Date.now(),remainingBudget?remainingBudget():Infinity,retryLeft());
      if(after<=0)return{kind:'stop',reason:'budget',lastReason};
