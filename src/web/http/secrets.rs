@@ -1,6 +1,6 @@
 use hyper::Request;
 
-use super::capability::{canonical_credential, scan_capabilities};
+use super::capability::canonical_credential;
 use crate::config::WebRuntimeConfig;
 use crate::web::manager::WebProcessRuntime;
 
@@ -67,8 +67,7 @@ fn contains_secret(text: &[u8], config: &WebRuntimeConfig, runtime: &WebProcessR
             }
             if run_len >= window.len()
                 && canonical_credential(&window).is_some_and(|candidate| {
-                    bool::from(scan_capabilities(&config.capabilities, &candidate).matched)
-                        || runtime.authentic_token(&candidate)
+                    config.capabilities.contains(&candidate) || runtime.authentic_token(&candidate)
                 })
             {
                 return true;

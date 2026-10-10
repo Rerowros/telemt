@@ -111,7 +111,7 @@ fn test_runtime_with_dc(
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
         vhosts: BTreeMap::new(),
         profiles: vec![Arc::clone(&profile)],
-        capabilities: vec![[7; 32]].into_boxed_slice(),
+        capabilities: vec![[7; 32]].into_iter().collect(),
     }));
     config.rebuild_runtime_user_auth().unwrap();
     let limits = config.web.limits.clone();

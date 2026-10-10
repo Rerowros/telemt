@@ -138,7 +138,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
         vhosts: runtime_vhosts,
         profiles: runtime_profiles,
-        capabilities: runtime_capabilities.into_boxed_slice(),
+        capabilities: runtime_capabilities.into_iter().collect(),
     }));
     Ok(())
 }

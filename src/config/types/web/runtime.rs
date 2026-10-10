@@ -8,7 +8,53 @@ pub(crate) struct WebRuntimeConfig {
     /// Flat profile inventory used by startup link emission.
     pub(crate) profiles: Vec<Arc<WebRuntimeProfile>>,
     /// Complete active capability table used to contain misplaced credentials.
-    pub(crate) capabilities: Box<[[u8; 32]]>,
+    pub(crate) capabilities: CapabilitySet,
+}
+
+/// Active capabilities in configuration order, plus a hashed index for the
+/// pre-routing credential scan. A lookup hashes the candidate with the
+/// per-process random SipHash key of `RandomState`, so its cost does not grow
+/// with the table and, unlike an ordered search, its timing carries nothing
+/// an outsider can steer toward a capability.
+#[derive(Clone, Default)]
+pub(crate) struct CapabilitySet {
+    table: Box<[[u8; 32]]>,
+    index: std::collections::HashSet<[u8; 32]>,
+}
+
+impl CapabilitySet {
+    /// Returns whether `candidate` is an active capability.
+    pub(crate) fn contains(&self, candidate: &[u8; 32]) -> bool {
+        self.index.contains(candidate)
+    }
+}
+
+impl std::ops::Deref for CapabilitySet {
+    type Target = [[u8; 32]];
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl PartialEq for CapabilitySet {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table
+    }
+}
+
+impl std::fmt::Debug for CapabilitySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CapabilitySet").field(&self.table).finish()
+    }
+}
+
+impl FromIterator<[u8; 32]> for CapabilitySet {
+    fn from_iter<I: IntoIterator<Item = [u8; 32]>>(iter: I) -> Self {
+        let table: Box<[[u8; 32]]> = iter.into_iter().collect();
+        let index = table.iter().copied().collect();
+        Self { table, index }
+    }
 }
 
 /// Precomputed immutable virtual-host data.

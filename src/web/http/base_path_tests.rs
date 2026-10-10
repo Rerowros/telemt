@@ -416,7 +416,7 @@ async fn prefixed_decoy_request_keeps_its_original_path_and_query() {
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
         vhosts,
         profiles: vec![profile],
-        capabilities: vec![capability].into_boxed_slice(),
+        capabilities: vec![capability].into_iter().collect(),
     }));
     let generation = test_runtime_generation(1, config);
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));

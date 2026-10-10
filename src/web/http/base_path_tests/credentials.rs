@@ -97,7 +97,7 @@ async fn every_authentic_credential_placement_stays_out_of_the_upstream() {
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
         vhosts,
         profiles: vec![profile],
-        capabilities: vec![capability].into_boxed_slice(),
+        capabilities: vec![capability].into_iter().collect(),
     }));
     let generation = test_runtime_generation(1, config);
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));

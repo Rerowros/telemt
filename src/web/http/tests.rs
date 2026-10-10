@@ -203,7 +203,7 @@ fn runtime_config_with_carriers_and_deadlines(
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
         vhosts,
         profiles: vec![profile],
-        capabilities: vec![capability].into_boxed_slice(),
+        capabilities: vec![capability].into_iter().collect(),
     }));
     config
 }
