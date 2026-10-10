@@ -644,6 +644,51 @@ Connection: close
     generation.stop_background_tasks().await;
 }
 
+#[tokio::test]
+async fn credential_scan_cost_never_shows_in_the_decoy_answer() {
+    // Probe-resistance regression: however much junk metadata a request
+    // carries, the decoy answers exactly as it would without the scan.
+    let capability = [82u8; 32];
+    let generation = test_runtime_generation(
+        1,
+        header_runtime_config(capability, WebCarrier::Https, 40000),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation.clone())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    // A long base64url query still gets the site, like a short one.
+    for len in [1000, 1100, 6000] {
+        let bytes = format!(
+            "GET /?x={} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n",
+            "A".repeat(len)
+        )
+        .into_bytes();
+        let response = request(&listener, &runtime, bytes).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "query of {len}: {}",
+            String::from_utf8_lossy(status(&response))
+        );
+    }
+
+    // A long junk header before a validator keeps the validator working.
+    let bytes = format!(
+        "GET /index.html HTTP/1.1\r\nHost: {HOST}\r\nX-Junk: {}\r\nIf-None-Match: \"test\"\r\nConnection: close\r\n\r\n",
+        "A".repeat(60_000)
+    )
+    .into_bytes();
+    let response = request(&listener, &runtime, bytes).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 304"),
+        "got {}",
+        String::from_utf8_lossy(status(&response))
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
 /// Creates one GET session with the negotiated uplink window of 4.
 async fn window_session(
     listener: &TcpListener,
