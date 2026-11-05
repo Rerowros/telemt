@@ -90,3 +90,14 @@ fn static_snapshot_remains_anchored_after_root_path_replacement() {
 
     assert_eq!(assets["/index.html"].body.as_ref(), b"original");
 }
+
+#[test]
+fn static_asset_etag_has_the_short_web_server_shape() {
+    let etag = static_asset_etag(b"hello");
+    assert_eq!(etag, static_asset_etag(b"hello"), "must stay stable across reloads");
+    assert_ne!(etag, static_asset_etag(b"world"));
+    let inner = etag.trim_matches('"');
+    let (hash, length) = inner.split_once('-').expect("hash and length");
+    assert_eq!(hash.len(), 8);
+    assert_eq!(length, "5");
+}
