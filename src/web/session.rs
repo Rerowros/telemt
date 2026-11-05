@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -28,6 +28,8 @@ use activity::SessionActivity;
 // Shared state helpers own queue accounting and bounded tombstone updates.
 mod state;
 use state::{inbound_queue_cost, insert_carrier_lane, remember_closed};
+// Wire shaping keeps carrier cadence and frame sizes free of fixed values.
+mod shape;
 // Downlink queues own cursor replay, flow control, and memory reservations.
 mod downlink;
 // Response ownership keeps detached batches charged until the last body clone drops.
@@ -241,6 +243,7 @@ pub(crate) struct WebSession {
     resident: Arc<resident::ResidentCounters>,
     finished: AtomicBool,
     up_active: AtomicBool,
+    shape_counter: AtomicU64,
 }
 
 /// One successful downlink poll result.
@@ -360,12 +363,31 @@ impl WebSession {
             resident: Arc::new(resident::ResidentCounters::default()),
             finished: AtomicBool::new(false),
             up_active: AtomicBool::new(false),
+            shape_counter: AtomicU64::new(0),
         })
     }
 
     /// Returns the stable hashed token identity without exposing the credential.
     pub(crate) fn token_hash(&self) -> TokenHash {
         self.token_hash
+    }
+
+    /// Mixes the session identity and per-session counter into a bounded shaping value.
+    fn shape_value(&self, salt: u64) -> u64 {
+        let counter = self.shape_counter.fetch_add(1, Ordering::Relaxed);
+        shape::mix(self.trace_session_id, counter, salt)
+    }
+
+    /// Returns the long-poll hold with per-poll jitter so the carrier has no fixed cadence.
+    pub(crate) fn long_poll_deadline(&self) -> Duration {
+        let value = self.shape_value(0x1001);
+        Duration::from_secs(shape::long_poll_secs(self.timeouts.long_poll_secs, value))
+    }
+
+    /// Returns the per-frame data ceiling, varied below the fixed chunk size.
+    pub(crate) fn data_chunk_limit(&self) -> usize {
+        let value = self.shape_value(0x2002);
+        shape::data_chunk_bytes(value).min(self.limits.max_frame_payload_bytes)
     }
 
     /// Checks the canonical virtual host that owns this bearer session.

@@ -159,7 +159,7 @@ impl WebSession {
         };
         let count = input
             .len()
-            .min(frame::DATA_CHUNK_BYTES)
+            .min(self.data_chunk_limit())
             .min(self.limits.max_frame_payload_bytes)
             .min(if self.carrier().uses_lanes() {
                 self.limits

@@ -489,3 +489,24 @@ fn bridge_diagnostic_hooks_preserve_native_and_recovery_contracts() {
     assert!(page.body.contains("clientDiagnostics.helloTimeout()"));
     assert!(!page.body.contains("port.postMessage({t:'status',state,"));
 }
+
+#[test]
+fn page_length_varies_between_renders_within_the_padding_bound() {
+    let base = DOCUMENT.len();
+    let lengths: std::collections::HashSet<usize> = (0..32)
+        .map(|_| render_page("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 2).body.len())
+        .collect();
+    assert!(lengths.len() > 1, "page size must not repeat on every load");
+    let (shortest, longest) = (
+        *lengths.iter().min().unwrap(),
+        *lengths.iter().max().unwrap(),
+    );
+    assert!(longest - shortest <= MAX_PAGE_PADDING_BYTES * 2);
+    assert!(longest > base);
+    let page = render_page("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 2);
+    assert!(!page.body.contains("__PAGE_PADDING__"));
+    let tail = page.body.rsplit("<!-- ").next().unwrap();
+    let padding = tail.split(" -->").next().unwrap();
+    assert!(padding.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(page.body.ends_with(" -->\n</body>\n</html>\n"));
+}

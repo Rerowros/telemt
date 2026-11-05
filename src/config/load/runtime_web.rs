@@ -416,7 +416,7 @@ fn load_static_file(
             display_path.display()
         )));
     }
-    let etag = format!("\"{}\"", hex::encode(Sha256::digest(&body)));
+    let etag = static_asset_etag(&body);
     assets.insert(
         route,
         WebStaticAsset {
@@ -426,6 +426,13 @@ fn load_static_file(
         },
     );
     Ok(())
+}
+
+/// Validator in the short `"hex-hex"` shape of common web servers: a full
+/// SHA-256 digest would set the decoy apart from an ordinary static site.
+fn static_asset_etag(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    format!("\"{}-{:x}\"", hex::encode(&digest[..4]), body.len())
 }
 
 #[cfg(unix)]

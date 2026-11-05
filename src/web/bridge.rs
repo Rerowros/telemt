@@ -6,6 +6,9 @@ use crate::crypto::SecureRandom;
 /// Browser security policy for the transient Telegram Desktop bridge page.
 pub(crate) const PERMISSIONS_POLICY: &str = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()";
 
+/// Upper bound of random bytes hidden in a page comment, hex-encoded on output.
+const MAX_PAGE_PADDING_BYTES: usize = 4096;
+
 /// Fully rendered bridge response and its per-response script policy.
 pub(crate) struct BridgePage {
     /// Complete transient HTML document.
@@ -117,7 +120,11 @@ pub(crate) fn render_with_get_url(
         String::new()
     };
     let base_prefix = base.strip_suffix('/').unwrap_or(base);
+    // Every page load used to be byte-identical in length, which makes the
+    // first response of a session recognisable by its size alone.
+    let padding = hex::encode(rng.bytes(rng.range(MAX_PAGE_PADDING_BYTES + 1)));
     let body = DOCUMENT
+        .replace("__PAGE_PADDING__", &padding)
         .replace("__DIAGNOSTIC_RUNTIME__\n", &diagnostic_script)
         .replace("__RESPONSE_RUNTIME__", RESPONSE_RUNTIME)
         .replace("__REQUEST_RUNTIME__", REQUEST_RUNTIME)

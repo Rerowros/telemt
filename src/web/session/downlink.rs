@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -94,7 +94,7 @@ impl WebSession {
         }
         self.down_notify.notify_waiters();
 
-        let deadline = Duration::from_secs(self.timeouts.long_poll_secs);
+        let deadline = self.long_poll_deadline();
         let poll = async {
             loop {
                 let notified = self.down_notify.notified();
