@@ -9,7 +9,12 @@ pub(crate) const MAX_STREAM_ID: u32 = 0x00ff_ffff;
 /// Initial bidirectional stream credit.
 pub(crate) const INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 /// Maximum data chunk emitted by the server.
+///
+/// iOS rejects a data frame whose payload exceeds `WebProxyProtocol.maximumDataPayload`
+/// (64 KiB), and both mobile clients answer a stream-zero Ping with a Pong, so the
+/// chunk ceiling must stay at or below this value and no padding frame type can be added.
 pub(crate) const DATA_CHUNK_BYTES: usize = 64 * 1024;
+const _: () = assert!(DATA_CHUNK_BYTES <= 64 * 1024);
 
 /// WEB frame type codes shared with Telegram Desktop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
